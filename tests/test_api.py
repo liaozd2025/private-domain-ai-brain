@@ -40,9 +40,31 @@ def mock_plan_runner():
         yield {
             "type": "plan",
             "content": [
-                {"content": "分析当前数据", "status": "in_progress"},
-                {"content": "制定执行动作", "status": "pending"},
+                {"task_id": "task_1", "content": "分析当前数据", "status": "in_progress"},
+                {"task_id": "task_2", "content": "制定执行动作", "status": "pending"},
             ],
+            "thread_id": kwargs["thread_id"],
+        }
+        yield {
+            "type": "task",
+            "content": {
+                "task_id": "task_1",
+                "content": "分析当前数据",
+                "status": "in_progress",
+            },
+            "thread_id": kwargs["thread_id"],
+        }
+        yield {
+            "type": "tool",
+            "content": {
+                "task_id": "task_1",
+                "tool_name": "analyze_uploaded_data",
+                "display_name": "分析表格数据",
+                "status": "started",
+                "summary": "开始分析当前上传的表格数据",
+                "duration_ms": None,
+            },
+            "thread_id": kwargs["thread_id"],
         }
         yield {"type": "token", "content": "计"}
         yield {"type": "token", "content": "划"}
@@ -97,6 +119,9 @@ def test_chat_basic(client, mock_orchestrator):
     assert "content" in data
     assert "thread_id" in data
     assert data["content"] == "这是 AI 的回答。"
+    assert data["requested_mode"] == "auto"
+    assert data["resolved_mode"] == "chat"
+    assert data["mode"] == "chat"
 
 
 def test_chat_generates_thread_id(client):
@@ -265,25 +290,63 @@ def test_chat_plan_mode_returns_plan(client):
     assert response.status_code == 200
     data = response.json()
     assert data["mode"] == "plan"
+    assert data["requested_mode"] == "plan"
+    assert data["resolved_mode"] == "plan"
     assert "plan" in data
     assert isinstance(data["plan"], list)
     assert data["content"] == "这是 plan 模式的回答。"
 
 
-def test_chat_stream_plan_mode_emits_plan_event_first(client):
-    """plan 模式流式接口应先发送计划事件，再进入执行阶段"""
+def test_chat_auto_mode_routes_planning_request_to_plan_runner(client, mock_plan_runner):
+    """auto 模式下明显的规划执行请求应走 plan runner。"""
+    response = client.post(
+        "/api/v1/chat",
+        json={
+            "message": "先规划再执行一份门店活动方案",
+            "user_id": "planner_auto",
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["requested_mode"] == "auto"
+    assert data["resolved_mode"] == "plan"
+    assert data["mode"] == "plan"
+    mock_plan_runner.invoke.assert_awaited_once()
+
+
+def test_chat_stream_plan_mode_emits_mode_and_progress_events(client):
+    """plan 流式接口应先发模式，再发计划和任务进度。"""
     with client.websocket_connect("/api/v1/chat/stream") as websocket:
         websocket.send_json(
             {
                 "message": "先规划再执行一份门店活动方案",
                 "user_id": "planner_ws",
-                "mode": "plan",
             }
         )
 
         first_event = websocket.receive_json()
-        assert first_event["type"] == "plan"
-        assert isinstance(first_event["content"], list)
+        second_event = websocket.receive_json()
+        third_event = websocket.receive_json()
+        fourth_event = websocket.receive_json()
+        fifth_event = websocket.receive_json()
+        sixth_event = websocket.receive_json()
+        done_event = websocket.receive_json()
+
+        assert first_event["type"] == "mode"
+        assert first_event["content"]["requested_mode"] == "auto"
+        assert first_event["content"]["resolved_mode"] == "plan"
+        assert second_event["type"] == "plan"
+        assert isinstance(second_event["content"], list)
+        assert third_event["type"] == "task"
+        assert third_event["content"]["status"] == "in_progress"
+        assert fourth_event["type"] == "tool"
+        assert fourth_event["content"]["tool_name"] == "analyze_uploaded_data"
+        assert fifth_event["type"] == "token"
+        assert sixth_event["type"] == "token"
+        assert done_event["type"] == "done"
+        assert done_event["requested_mode"] == "auto"
+        assert done_event["resolved_mode"] == "plan"
 
 
 def test_list_conversations_returns_user_scoped_sessions(client):

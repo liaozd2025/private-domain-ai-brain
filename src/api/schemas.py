@@ -29,7 +29,7 @@ class ChatRequest(BaseModel):
     channel: Literal["web", "wecom", "openclaw"] = Field(
         default="web", description="来源渠道"
     )
-    mode: Literal["chat", "plan"] = Field(default="chat", description="聊天模式")
+    mode: Literal["auto", "chat", "plan"] = Field(default="auto", description="聊天模式")
     attachments: list[AttachmentRef] = Field(
         default_factory=list, description="关联的已上传附件 ID 列表"
     )
@@ -45,6 +45,8 @@ class ChatResponse(BaseModel):
     message_id: str
     content: str
     mode: Literal["chat", "plan"] = "chat"
+    requested_mode: Literal["auto", "chat", "plan"] = "auto"
+    resolved_mode: Literal["chat", "plan"] = "chat"
     plan: list[PlanStep] | None = None
     query_type: str | None = None
     model: str | None = None
@@ -52,10 +54,12 @@ class ChatResponse(BaseModel):
 
 class StreamChunk(BaseModel):
     """流式响应 chunk"""
-    type: Literal["token", "done", "error", "plan", "step"]
+    type: Literal["mode", "token", "done", "error", "plan", "step", "task", "tool"]
     content: Any = ""
     thread_id: str | None = None
     query_type: str | None = None
+    requested_mode: Literal["auto", "chat", "plan"] | None = None
+    resolved_mode: Literal["chat", "plan"] | None = None
 
 
 # ===== 文件相关 =====

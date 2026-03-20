@@ -23,6 +23,7 @@ logger = structlog.get_logger(__name__)
 router = APIRouter()
 
 SUPPORTED_MODELS = {
+    "private-domain-auto": "auto",
     "private-domain-chat": "chat",
     "private-domain-plan": "plan",
 }
@@ -250,7 +251,11 @@ async def _run_non_stream(payload: OpenAIChatCompletionRequest) -> dict[str, Any
     user_id = payload.user or "openai_compat"
     thread_id = f"oa_{uuid.uuid4().hex[:16]}"
 
-    mode = SUPPORTED_MODELS[payload.model]
+    mode = await _resolve_mode(
+        requested_mode=SUPPORTED_MODELS[payload.model],
+        prompt=prompt,
+        attachments=attachments,
+    )
     if mode == "plan":
         from src.agent.plan_runner import get_plan_runner
 
@@ -390,6 +395,28 @@ async def _stream_chat_events(
     yield "data: [DONE]\n\n"
 
 
+async def _resolve_mode(
+    *,
+    requested_mode: Literal["auto", "chat", "plan"],
+    prompt: str,
+    attachments: list[dict[str, Any]],
+) -> Literal["chat", "plan"]:
+    if requested_mode in {"chat", "plan"}:
+        return requested_mode
+
+    from src.agent.mode_selector import get_mode_selector
+
+    selector = await get_mode_selector()
+    decision = await selector.resolve_mode(
+        message=prompt,
+        requested_mode="auto",
+        attachments=attachments,
+        user_role="unknown",
+        channel="web",
+    )
+    return str(decision["resolved_mode"])
+
+
 @router.get("/models")
 async def list_models() -> dict[str, Any]:
     """列出 OpenAI 兼容层可用模型。"""
@@ -419,7 +446,11 @@ async def create_chat_completion(payload: OpenAIChatCompletionRequest):
         return await _run_non_stream(payload)
 
     prompt, attachments = await _translate_messages(payload.messages)
-    mode = SUPPORTED_MODELS[payload.model]
+    mode = await _resolve_mode(
+        requested_mode=SUPPORTED_MODELS[payload.model],
+        prompt=prompt,
+        attachments=attachments,
+    )
     if mode == "plan":
         generator = _stream_plan_events(payload, prompt, attachments)
     else:

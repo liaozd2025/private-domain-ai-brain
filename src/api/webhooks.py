@@ -21,6 +21,18 @@ logger = structlog.get_logger(__name__)
 router = APIRouter()
 
 
+def _render_plan_text(plan: list[dict[str, str]], content: str) -> str:
+    lines = ["## 计划"]
+    for index, item in enumerate(plan, start=1):
+        task = str(item.get("content", "")).strip()
+        if task:
+            lines.append(f"{index}. {task}")
+    plan_text = "\n".join(lines) if len(lines) > 1 else ""
+    if plan_text and content:
+        return f"{plan_text}\n\n## 执行结果\n{content}"
+    return plan_text or content
+
+
 # ===== 企微 Webhook =====
 
 def verify_wecom_signature(
@@ -95,17 +107,37 @@ async def wecom_receive(
 async def handle_wecom_message(from_user: str, content: str, agent_id: str):
     """处理企微消息（后台任务）"""
     try:
+        from src.agent.mode_selector import get_mode_selector
         from src.agent.orchestrator import get_orchestrator
+        from src.agent.plan_runner import get_plan_runner
         from src.memory.conversations import record_conversation_turn
+
+        mode_selector = await get_mode_selector()
         orchestrator = await get_orchestrator()
 
         thread_id = f"wecom_{from_user}"
-        response = await orchestrator.invoke(
+        mode_decision = await mode_selector.resolve_mode(
             message=content,
-            thread_id=thread_id,
-            user_id=from_user,
+            requested_mode="auto",
+            user_role="unknown",
             channel="wecom",
         )
+        if mode_decision["resolved_mode"] == "plan":
+            plan_runner = await get_plan_runner()
+            result = await plan_runner.invoke(
+                message=content,
+                thread_id=thread_id,
+                user_id=from_user,
+                channel="wecom",
+            )
+            response = _render_plan_text(result.plan, result.content)
+        else:
+            response = await orchestrator.invoke(
+                message=content,
+                thread_id=thread_id,
+                user_id=from_user,
+                channel="wecom",
+            )
         await record_conversation_turn(
             thread_id=thread_id,
             user_id=from_user,
@@ -194,17 +226,37 @@ async def handle_openclaw_message(
 ):
     """处理 OpenClaw 消息（后台任务）"""
     try:
+        from src.agent.mode_selector import get_mode_selector
         from src.agent.orchestrator import get_orchestrator
+        from src.agent.plan_runner import get_plan_runner
         from src.memory.conversations import record_conversation_turn
+
+        mode_selector = await get_mode_selector()
         orchestrator = await get_orchestrator()
 
         thread_id = f"openclaw_{user_id}_{channel}"
-        response = await orchestrator.invoke(
+        mode_decision = await mode_selector.resolve_mode(
             message=message,
-            thread_id=thread_id,
-            user_id=user_id,
+            requested_mode="auto",
+            user_role="unknown",
             channel="openclaw",
         )
+        if mode_decision["resolved_mode"] == "plan":
+            plan_runner = await get_plan_runner()
+            result = await plan_runner.invoke(
+                message=message,
+                thread_id=thread_id,
+                user_id=user_id,
+                channel="openclaw",
+            )
+            response = _render_plan_text(result.plan, result.content)
+        else:
+            response = await orchestrator.invoke(
+                message=message,
+                thread_id=thread_id,
+                user_id=user_id,
+                channel="openclaw",
+            )
         await record_conversation_turn(
             thread_id=thread_id,
             user_id=user_id,

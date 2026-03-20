@@ -34,8 +34,10 @@ async def chat_stream(websocket: WebSocket):
     logger.info("WebSocket 连接建立")
 
     try:
+        from src.agent.mode_selector import get_mode_selector
         from src.agent.orchestrator import get_orchestrator
         orchestrator = await get_orchestrator()
+        mode_selector = await get_mode_selector()
 
         while True:
             # 接收消息
@@ -56,7 +58,7 @@ async def chat_stream(websocket: WebSocket):
             user_id = data.get("user_id", "anonymous")
             user_role = data.get("user_role", "unknown")
             channel = data.get("channel", "web")
-            mode = data.get("mode", "chat")
+            mode = data.get("mode", "auto")
             attachments = data.get("attachments", [])
 
             logger.info(
@@ -69,7 +71,23 @@ async def chat_stream(websocket: WebSocket):
             # 流式输出
             try:
                 resolved_attachments = resolve_attachment_refs(attachments, user_id)
-                if mode == "plan":
+                mode_decision = await mode_selector.resolve_mode(
+                    message=message,
+                    requested_mode=mode,
+                    attachments=resolved_attachments,
+                    user_role=user_role,
+                    channel=channel,
+                )
+                resolved_mode = str(mode_decision["resolved_mode"])
+                await websocket.send_json({
+                    "type": "mode",
+                    "thread_id": thread_id,
+                    "content": mode_decision,
+                    "requested_mode": mode_decision["requested_mode"],
+                    "resolved_mode": resolved_mode,
+                })
+
+                if resolved_mode == "plan":
                     from src.agent.plan_runner import get_plan_runner
                     from src.memory.conversations import record_conversation_turn
 
@@ -82,6 +100,12 @@ async def chat_stream(websocket: WebSocket):
                         channel=channel,
                         attachments=resolved_attachments,
                     ):
+                        if event.get("type") == "done":
+                            event = {
+                                **event,
+                                "requested_mode": mode_decision["requested_mode"],
+                                "resolved_mode": resolved_mode,
+                            }
                         await websocket.send_json(event)
                     await record_conversation_turn(
                         thread_id=thread_id,
@@ -107,6 +131,8 @@ async def chat_stream(websocket: WebSocket):
                         "type": "done",
                         "thread_id": thread_id,
                         "content": "",
+                        "requested_mode": mode_decision["requested_mode"],
+                        "resolved_mode": resolved_mode,
                     })
                     await record_conversation_turn(
                         thread_id=thread_id,

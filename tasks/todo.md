@@ -178,3 +178,23 @@
   - `python -m pytest tests/test_db_scripts.py -q` → `1 passed in 0.01s`
   - `python -m ruff check tests/test_db_scripts.py` → `All checks passed!`
   - `python -m pytest tests -q` → `61 passed in 2.12s`
+
+## Auto Mode And Plan Progress
+
+- [x] Add failing tests for automatic chat/plan selection, response mode fields, and rich plan progress events.
+- [x] Implement a reusable mode selector with explicit override, heuristic routing, and conservative fallback.
+- [x] Wire auto mode into sync chat, streaming chat, webhooks, and OpenAI compatibility aliases.
+- [x] Upgrade plan streaming events so the frontend can render task/tool progress safely.
+- [x] Update docs and record verification evidence.
+
+## Auto Mode And Plan Progress Notes
+
+- 2026-03-20: Current behavior still relies on explicit `mode=chat|plan` for first-party APIs and `private-domain-chat|private-domain-plan` model aliases for `/v1`; there is no backend auto-selection layer yet.
+- 2026-03-20: Added RED tests for `ModeSelector`, default `mode=auto`, `requested_mode/resolved_mode` response fields, WebSocket `mode/task/tool` events, and `private-domain-auto` alias; initial `python -m pytest tests/test_mode_selector.py tests/test_api.py tests/test_openai_compat.py -q` failed with 10 expected failures because the selector module, new response fields, and auto alias did not exist.
+- 2026-03-20: Added `src/agent/mode_selector.py` with explicit override, heuristic-first routing, lazy LLM fallback, and conservative chat fallback.
+- 2026-03-20: Updated first-party sync/streaming chat, WeCom/OpenClaw webhooks, and `/v1/chat/completions` to use the selector; OpenAI compatibility now exposes `private-domain-auto`.
+- 2026-03-20: Upgraded `plan_runner.stream()` to emit richer `plan/task/tool/token/done` progress events with safe summaries so the frontend can show Manus/Claude Code-style background activity.
+- 2026-03-20: Verified:
+  - `python -m pytest tests/test_mode_selector.py tests/test_api.py tests/test_openai_compat.py -q` → `31 passed in 1.78s`
+  - `python -m ruff check src/agent/mode_selector.py src/agent/plan_runner.py src/api/routes.py src/api/schemas.py src/api/streaming.py src/api/openai_compat.py src/api/webhooks.py tests/test_mode_selector.py tests/test_api.py tests/test_openai_compat.py` → `All checks passed!`
+  - `python -m pytest tests -q` → `67 passed in 2.75s`

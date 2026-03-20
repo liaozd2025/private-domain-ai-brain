@@ -84,8 +84,50 @@ def test_openai_models_lists_adapter_aliases(client):
     assert response.status_code == 200
     data = response.json()
     model_ids = {item["id"] for item in data["data"]}
+    assert "private-domain-auto" in model_ids
     assert "private-domain-chat" in model_ids
     assert "private-domain-plan" in model_ids
+
+
+def test_openai_chat_completion_auto_model_routes_simple_prompt_to_chat(
+    client,
+    mock_orchestrator,
+    mock_plan_runner,
+):
+    """auto 模型别名应对普通请求走 chat。"""
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "private-domain-auto",
+            "messages": [{"role": "user", "content": "帮我分析今天门店转化率"}],
+            "user": "auto_user_chat",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "这是 chat 模式回答。"
+    mock_orchestrator.invoke.assert_awaited_once()
+    mock_plan_runner.invoke.assert_not_awaited()
+
+
+def test_openai_chat_completion_auto_model_routes_planning_prompt_to_plan(
+    client,
+    mock_plan_runner,
+):
+    """auto 模型别名应对明显的规划执行请求走 plan。"""
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "private-domain-auto",
+            "messages": [{"role": "user", "content": "先规划再执行一份会员召回方案"}],
+            "user": "auto_user_plan",
+        },
+    )
+
+    assert response.status_code == 200
+    content = response.json()["choices"][0]["message"]["content"]
+    assert "计划" in content
+    mock_plan_runner.invoke.assert_awaited_once()
 
 
 def test_openai_chat_completion_uses_chat_model_alias(client, mock_orchestrator):

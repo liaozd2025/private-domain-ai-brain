@@ -34,6 +34,12 @@ PLAN_SYSTEM_PROMPT = """你现在运行在 plan 模式。
 """
 
 TABULAR_FILE_TYPES = {"csv", "excel"}
+TOOL_DISPLAY_NAMES = {
+    "research_private_domain_knowledge": "检索知识库",
+    "generate_operational_content": "生成运营内容",
+    "analyze_uploaded_attachments": "分析附件",
+    "analyze_uploaded_data": "分析表格数据",
+}
 
 
 @dataclass
@@ -111,12 +117,21 @@ class DeepPlanRunner:
 
         latest_plan = self._fallback_plan(message, in_progress=True)
         yielded_real_plan = False
+        emitted_task_states: dict[str, str] = {
+            item["task_id"]: item["status"] for item in latest_plan
+        }
 
         yield {
             "type": "plan",
             "content": latest_plan,
             "thread_id": thread_id,
         }
+        for item in latest_plan:
+            yield {
+                "type": "task",
+                "content": item,
+                "thread_id": thread_id,
+            }
 
         async for event in agent.astream_events(
             {"messages": [{"role": "user", "content": message}]},
@@ -133,13 +148,70 @@ class DeepPlanRunner:
             if kind == "on_tool_end" and name == "write_todos":
                 plan = self._normalize_todos(data.get("input", {}).get("todos", []))
                 if plan:
+                    changed_tasks = self._collect_changed_tasks(plan, emitted_task_states)
                     latest_plan = plan
                     yielded_real_plan = True
+                    yield {
+                        "type": "plan",
+                        "content": latest_plan,
+                        "thread_id": thread_id,
+                    }
                     yield {
                         "type": "step",
                         "content": latest_plan,
                         "thread_id": thread_id,
                     }
+                    for task in changed_tasks:
+                        yield {
+                            "type": "task",
+                            "content": task,
+                            "thread_id": thread_id,
+                        }
+                continue
+
+            if kind == "on_tool_start" and name != "write_todos":
+                yield {
+                    "type": "tool",
+                    "content": {
+                        "task_id": self._current_task_id(latest_plan),
+                        "tool_name": name,
+                        "display_name": TOOL_DISPLAY_NAMES.get(name, "执行外部动作"),
+                        "status": "started",
+                        "summary": self._build_tool_summary(name, data.get("input"), started=True),
+                        "duration_ms": None,
+                    },
+                    "thread_id": thread_id,
+                }
+                continue
+
+            if kind == "on_tool_end" and name != "write_todos":
+                yield {
+                    "type": "tool",
+                    "content": {
+                        "task_id": self._current_task_id(latest_plan),
+                        "tool_name": name,
+                        "display_name": TOOL_DISPLAY_NAMES.get(name, "执行外部动作"),
+                        "status": "completed",
+                        "summary": self._build_tool_summary(name, data.get("output")),
+                        "duration_ms": None,
+                    },
+                    "thread_id": thread_id,
+                }
+                continue
+
+            if kind == "on_tool_error" and name != "write_todos":
+                yield {
+                    "type": "tool",
+                    "content": {
+                        "task_id": self._current_task_id(latest_plan),
+                        "tool_name": name,
+                        "display_name": TOOL_DISPLAY_NAMES.get(name, "执行外部动作"),
+                        "status": "failed",
+                        "summary": self._truncate_summary(data.get("error") or "工具执行失败"),
+                        "duration_ms": None,
+                    },
+                    "thread_id": thread_id,
+                }
                 continue
 
             if kind == "on_chat_model_stream":
@@ -255,23 +327,70 @@ class DeepPlanRunner:
 
     def _normalize_todos(self, todos: list[dict[str, Any]]) -> list[dict[str, str]]:
         normalized: list[dict[str, str]] = []
-        for todo in todos:
+        for index, todo in enumerate(todos, start=1):
             content = str(todo.get("content", "")).strip()
             status = str(todo.get("status", "pending")).strip() or "pending"
             if not content:
                 continue
             if status not in {"pending", "in_progress", "completed"}:
                 status = "pending"
-            normalized.append({"content": content, "status": status})
+            normalized.append({
+                "task_id": f"task_{index}",
+                "content": content,
+                "status": status,
+            })
         return normalized
 
     def _fallback_plan(self, message: str, *, in_progress: bool = False) -> list[dict[str, str]]:
         return [
             {
+                "task_id": "task_1",
                 "content": f"围绕用户请求制定并执行方案：{message[:60]}",
                 "status": "in_progress" if in_progress else "completed",
             }
         ]
+
+    def _collect_changed_tasks(
+        self,
+        plan: list[dict[str, str]],
+        emitted_task_states: dict[str, str],
+    ) -> list[dict[str, str]]:
+        changed: list[dict[str, str]] = []
+        for item in plan:
+            task_id = item["task_id"]
+            status = item["status"]
+            if emitted_task_states.get(task_id) != status:
+                emitted_task_states[task_id] = status
+                changed.append(item)
+        return changed
+
+    def _current_task_id(self, plan: list[dict[str, str]]) -> str | None:
+        for item in plan:
+            if item.get("status") == "in_progress":
+                return item.get("task_id")
+        if plan:
+            return plan[0].get("task_id")
+        return None
+
+    def _build_tool_summary(
+        self,
+        tool_name: str,
+        payload: Any,
+        *,
+        started: bool = False,
+    ) -> str:
+        display_name = TOOL_DISPLAY_NAMES.get(tool_name, "外部动作")
+        if started:
+            return f"开始{display_name}"
+        if payload is None:
+            return f"{display_name}已完成"
+        return self._truncate_summary(str(payload))
+
+    def _truncate_summary(self, value: str, limit: int = 120) -> str:
+        text = " ".join(str(value).split())
+        if len(text) <= limit:
+            return text
+        return f"{text[:limit].rstrip()}..."
 
 
 _plan_runner: DeepPlanRunner | None = None

@@ -53,6 +53,12 @@ async def get_plan_runner_dep():
     return await get_plan_runner()
 
 
+async def get_mode_selector_dep():
+    """获取自动模式选择器依赖"""
+    from src.agent.mode_selector import get_mode_selector
+    return await get_mode_selector()
+
+
 # ===== 聊天端点 =====
 
 @router.post("/chat", response_model=ChatResponse)
@@ -60,6 +66,7 @@ async def chat(
     request: ChatRequest,
     orchestrator=Depends(get_orchestrator_dep),
     plan_runner=Depends(get_plan_runner_dep),
+    mode_selector=Depends(get_mode_selector_dep),
 ):
     """发送消息，获取 AI 回答（同步模式）
 
@@ -81,7 +88,16 @@ async def chat(
             request.user_id,
         )
 
-        if request.mode == "plan":
+        mode_decision = await mode_selector.resolve_mode(
+            message=request.message,
+            requested_mode=request.mode,
+            attachments=resolved_attachments,
+            user_role=request.user_role,
+            channel=request.channel,
+        )
+        resolved_mode = str(mode_decision["resolved_mode"])
+
+        if resolved_mode == "plan":
             response = await plan_runner.invoke(
                 message=request.message,
                 thread_id=thread_id,
@@ -103,6 +119,8 @@ async def chat(
                 message_id=f"msg_{uuid.uuid4().hex[:12]}",
                 content=response.content,
                 mode="plan",
+                requested_mode=request.mode,
+                resolved_mode="plan",
                 plan=response.plan,
                 model=response.model,
             )
@@ -130,6 +148,8 @@ async def chat(
             message_id=f"msg_{uuid.uuid4().hex[:12]}",
             content=response,
             mode="chat",
+            requested_mode=request.mode,
+            resolved_mode="chat",
         )
 
     except AttachmentAccessError as e:

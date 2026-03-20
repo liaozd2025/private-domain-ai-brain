@@ -65,17 +65,17 @@ psql "$DATABASE_URL" -f scripts/migrations/2026-03-20-add-conversation-metadata.
 
 ## Chat 与 Plan 模式
 
-普通对话默认使用 `mode=chat`，走现有编排器：
+一方接口现在默认使用 `mode=auto`。后端会保守判断本轮请求走普通 `chat` 还是 `plan`：
 
 ```json
 {
   "message": "我是门店老板，帮我做一个提升会员复购率的三步方案",
   "user_id": "boss_001",
-  "mode": "chat"
+  "mode": "auto"
 }
 ```
 
-如需“先规划、再执行、再汇报”，传 `mode=plan`。该模式基于 Deep Agents，会返回 `plan` 字段，并在 WebSocket 中先发送 `plan/step` 事件：
+如果你要强制覆盖自动判断，仍然可以显式传 `mode=chat` 或 `mode=plan`。`plan` 模式基于 Deep Agents；同步接口会返回 `requested_mode` 和 `resolved_mode`，WebSocket 会先发 `mode` 事件，再按 `plan/task/tool/token/done` 输出执行进度：
 
 ```json
 {
@@ -91,17 +91,18 @@ psql "$DATABASE_URL" -f scripts/migrations/2026-03-20-add-conversation-metadata.
 
 - Base URL: `http://localhost:8000/v1`
 - Model:
+  - `private-domain-auto`：自动选择 chat 或 plan
   - `private-domain-chat`：普通聊天
   - `private-domain-plan`：计划模式，会把内部 plan 渲染成文本再返回
 - API Key：首版兼容层不校验，可按 Cherry Studio 要求随便填一个占位值
 
-普通聊天示例：
+自动模式示例：
 
 ```bash
 curl -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "private-domain-chat",
+    "model": "private-domain-auto",
     "messages": [
       {"role": "system", "content": "你是门店经营顾问"},
       {"role": "user", "content": "帮我分析今天门店转化率"}
