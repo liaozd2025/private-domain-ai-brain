@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+.env
+
+# Uploads
+uploads/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Models (large files)
+models/
+*.bin
+*.safetensors
+*.ot
+*.onnx
+
+# Charts
+uploads/charts/
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test
+.coverage
+.pytest_cache/
+htmlcov/
