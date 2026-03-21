@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import mimetypes
+import re
 import time
 import uuid
 from pathlib import Path
@@ -51,6 +53,7 @@ class OpenAIChatCompletionRequest(BaseModel):
     logprobs: bool | None = None
     audio: dict[str, Any] | None = None
     modalities: list[str] | None = None
+    metadata: dict[str, Any] | None = None
 
 
 def _reject_unsupported_fields(payload: OpenAIChatCompletionRequest) -> None:
@@ -82,6 +85,91 @@ def _build_messages_prompt(messages: list[tuple[str, str]]) -> str:
             continue
         sections.append(f"[{role}]\n{content}")
     return "\n\n".join(sections)
+
+
+def _extract_message_text(message: OpenAIMessage) -> str:
+    if isinstance(message.content, str) or message.content is None:
+        return (message.content or "").strip()
+
+    parts: list[str] = []
+    for part in message.content:
+        if part.get("type") == "text":
+            parts.append(str(part.get("text", "")))
+    return "\n".join(part for part in parts if part).strip()
+
+
+def _latest_user_text(messages: list[OpenAIMessage]) -> str:
+    for message in reversed(messages):
+        if message.role == "user":
+            text = _extract_message_text(message)
+            if text:
+                return text
+    return ""
+
+
+def _first_user_text(messages: list[OpenAIMessage]) -> str:
+    for message in messages:
+        if message.role == "user":
+            text = _extract_message_text(message)
+            if text:
+                return text
+    return ""
+
+
+def _compat_user_role(payload: OpenAIChatCompletionRequest) -> str:
+    metadata = payload.metadata or {}
+    return str(metadata.get("user_role", "unknown"))
+
+
+def _compat_thread_id(payload: OpenAIChatCompletionRequest) -> str:
+    metadata = payload.metadata or {}
+    thread_id = str(metadata.get("thread_id", "")).strip()
+    if thread_id:
+        return thread_id
+
+    user_id = payload.user or "openai_compat"
+    first_user = _first_user_text(payload.messages) or str(uuid.uuid4())
+    digest = hashlib.sha1(first_user.encode("utf-8")).hexdigest()[:16]
+    safe_user = re.sub(r"[^A-Za-z0-9_-]", "_", user_id)[:48] or "openai_compat"
+    return f"oa_{safe_user}_{digest}"
+
+
+def _requested_human_handoff(text: str) -> bool:
+    keywords = ("人工", "人工客服", "转人工", "真人", "客服")
+    normalized = text.strip()
+    return any(keyword in normalized for keyword in keywords)
+
+
+async def get_customer_service_supervisor():
+    from src.agent.customer_service import get_customer_service_supervisor as _getter
+
+    return await _getter()
+
+
+async def get_customer_service_store():
+    from src.memory.customer_service import get_customer_service_store as _getter
+
+    return _getter()
+
+
+async def _should_route_customer_service(
+    payload: OpenAIChatCompletionRequest,
+    thread_id: str,
+) -> bool:
+    if _compat_user_role(payload) == "customer":
+        return True
+
+    latest_user_text = _latest_user_text(payload.messages)
+    if _requested_human_handoff(latest_user_text):
+        return True
+
+    if not payload.user and not (payload.metadata or {}).get("thread_id"):
+        return False
+
+    store = await get_customer_service_store()
+    if await store.get_active_handoff(thread_id):
+        return True
+    return await store.is_customer_thread(thread_id, user_id=payload.user or "openai_compat")
 
 
 def _render_plan(plan: list[dict[str, str]]) -> str:
@@ -177,6 +265,22 @@ def _image_extension_from_mime(mime_type: str | None) -> str:
     return guessed or ".bin"
 
 
+def _is_private_host(hostname: str) -> bool:
+    """Check if hostname resolves to a private/loopback/reserved IP."""
+    import ipaddress
+    import socket
+
+    try:
+        addrs = socket.getaddrinfo(hostname, None)
+        for addr in addrs:
+            ip = ipaddress.ip_address(addr[4][0])
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+                return True
+        return False
+    except Exception:
+        return True  # Fail safe: block on resolution errors
+
+
 async def _materialize_image(url: str) -> dict[str, Any]:
     parsed = urlparse(url)
     if parsed.scheme not in SUPPORTED_IMAGE_SCHEMES:
@@ -187,15 +291,38 @@ async def _materialize_image(url: str) -> dict[str, Any]:
     file_id = uuid.uuid4().hex
 
     if parsed.scheme == "data":
+        # Validate data URL format
+        if "," not in url:
+            raise HTTPException(status_code=400, detail="无效的 data URL 格式")
         header, encoded = url.split(",", maxsplit=1)
+        if ":" not in header or ";" not in header:
+            raise HTTPException(status_code=400, detail="无效的 data URL 格式")
         mime_type = header.split(":", 1)[1].split(";", 1)[0]
+        if not mime_type.startswith("image/"):
+            raise HTTPException(status_code=400, detail=f"不支持的图片格式: {mime_type}")
+        try:
+            image_data = base64.b64decode(encoded)
+        except Exception:
+            raise HTTPException(status_code=400, detail="无效的 base64 图片数据")
+        if len(image_data) > 20 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="图片数据过大（上限 20MB）")
         suffix = _image_extension_from_mime(mime_type)
         file_path = image_dir / f"{file_id}{suffix}"
-        file_path.write_bytes(base64.b64decode(encoded))
+        file_path.write_bytes(image_data)
     else:
+        # SSRF protection: block private/loopback addresses
+        hostname = parsed.hostname or ""
+        if not hostname or _is_private_host(hostname):
+            raise HTTPException(status_code=400, detail="不允许访问内网地址")
+
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(url)
             response.raise_for_status()
+
+        # Limit response size to 10MB
+        if len(response.content) > 10 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="图片过大（上限 10MB）")
+
         mime_type = response.headers.get("content-type", "").split(";", 1)[0]
         suffix = Path(parsed.path).suffix or _image_extension_from_mime(mime_type)
         file_path = image_dir / f"{file_id}{suffix}"
@@ -249,7 +376,27 @@ async def _translate_messages(
 async def _run_non_stream(payload: OpenAIChatCompletionRequest) -> dict[str, Any]:
     prompt, attachments = await _translate_messages(payload.messages)
     user_id = payload.user or "openai_compat"
-    thread_id = f"oa_{uuid.uuid4().hex[:16]}"
+    thread_id = _compat_thread_id(payload)
+    latest_user_text = _latest_user_text(payload.messages) or prompt
+
+    if await _should_route_customer_service(payload, thread_id):
+        from src.memory.conversations import record_conversation_turn
+
+        supervisor = await get_customer_service_supervisor()
+        result = await supervisor.invoke(
+            message=latest_user_text,
+            thread_id=thread_id,
+            user_id=user_id,
+            channel="web",
+        )
+        await record_conversation_turn(
+            thread_id=thread_id,
+            user_id=user_id,
+            user_role="customer",
+            message=latest_user_text,
+            channel="web",
+        )
+        return _build_chat_response(payload.model, result.content)
 
     mode = await _resolve_mode(
         requested_mode=SUPPORTED_MODELS[payload.model],
@@ -361,10 +508,50 @@ async def _stream_chat_events(
     prompt: str,
     attachments: list[dict[str, Any]],
 ):
+    from src.memory.conversations import record_conversation_turn
+
+    thread_id = _compat_thread_id(payload)
+    latest_user_text = _latest_user_text(payload.messages) or prompt
+    if await _should_route_customer_service(payload, thread_id):
+        supervisor = await get_customer_service_supervisor()
+        completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+
+        yield _build_stream_chunk(
+            completion_id=completion_id,
+            model=payload.model,
+            include_role=True,
+        )
+
+        async for token in supervisor.stream(
+            message=latest_user_text,
+            thread_id=thread_id,
+            user_id=payload.user or "openai_compat",
+            channel="web",
+        ):
+            yield _build_stream_chunk(
+                completion_id=completion_id,
+                model=payload.model,
+                content=str(token),
+            )
+
+        await record_conversation_turn(
+            thread_id=thread_id,
+            user_id=payload.user or "openai_compat",
+            user_role="customer",
+            message=latest_user_text,
+            channel="web",
+        )
+        yield _build_stream_chunk(
+            completion_id=completion_id,
+            model=payload.model,
+            finish_reason="stop",
+        )
+        yield "data: [DONE]\n\n"
+        return
+
     from src.agent.orchestrator import get_orchestrator
 
     orchestrator = await get_orchestrator()
-    thread_id = f"oa_{uuid.uuid4().hex[:16]}"
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
 
     yield _build_stream_chunk(
@@ -446,6 +633,11 @@ async def create_chat_completion(payload: OpenAIChatCompletionRequest):
         return await _run_non_stream(payload)
 
     prompt, attachments = await _translate_messages(payload.messages)
+    thread_id = _compat_thread_id(payload)
+    if await _should_route_customer_service(payload, thread_id):
+        generator = _stream_chat_events(payload, prompt, attachments)
+        return StreamingResponse(generator, media_type="text/event-stream")
+
     mode = await _resolve_mode(
         requested_mode=SUPPORTED_MODELS[payload.model],
         prompt=prompt,

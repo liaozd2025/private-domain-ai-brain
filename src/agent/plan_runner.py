@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import structlog
 from deepagents import create_deep_agent
+from deepagents.backends.filesystem import FilesystemBackend
 from langchain_core.tools import tool
 
 from src.agent.orchestrator import build_system_prompt, create_llm
@@ -22,6 +25,10 @@ if TYPE_CHECKING:
     from langgraph.checkpoint.base import BaseCheckpointSaver
 
 logger = structlog.get_logger(__name__)
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEEPAGENTS_BACKEND_ROOT = PROJECT_ROOT / "src"
+DEEPAGENTS_SKILL_SOURCES = ["/skills"]
 
 PLAN_SYSTEM_PROMPT = """你现在运行在 plan 模式。
 
@@ -267,6 +274,12 @@ class DeepPlanRunner:
             model=self.llm,
             tools=tools,
             system_prompt=system_prompt,
+            skills=DEEPAGENTS_SKILL_SOURCES,
+            # Scope filesystem access to `src/` only and enable virtual path guardrails.
+            backend=FilesystemBackend(
+                root_dir=DEEPAGENTS_BACKEND_ROOT,
+                virtual_mode=True,
+            ),
             checkpointer=self.checkpointer,
             name="private-domain-plan-runner",
         )
@@ -394,14 +407,18 @@ class DeepPlanRunner:
 
 
 _plan_runner: DeepPlanRunner | None = None
+_plan_runner_lock = asyncio.Lock()
 
 
 async def get_plan_runner() -> DeepPlanRunner:
     global _plan_runner
-    if _plan_runner is None:
-        from src.memory.checkpointer import get_checkpointer
+    if _plan_runner is not None:
+        return _plan_runner
+    async with _plan_runner_lock:
+        if _plan_runner is None:
+            from src.memory.checkpointer import get_checkpointer
 
-        checkpointer = await get_checkpointer()
-        _plan_runner = DeepPlanRunner(checkpointer=checkpointer)
-        logger.info("Deep plan runner 初始化完成")
+            checkpointer = await get_checkpointer()
+            _plan_runner = DeepPlanRunner(checkpointer=checkpointer)
+            logger.info("Deep plan runner 初始化完成")
     return _plan_runner

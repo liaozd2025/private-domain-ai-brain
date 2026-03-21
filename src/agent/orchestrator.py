@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncGenerator
 
 import structlog
@@ -362,15 +363,16 @@ class Orchestrator:
 
         user_id = state.get("user_id", "")
         if user_id:
-            # 异步提取画像（不阻塞响应）
-            import asyncio
-            asyncio.create_task(
+            # 异步提取画像（不阻塞响应）- 保存引用防止 GC 提前回收
+            task = asyncio.create_task(
                 extract_and_update_profile(
                     user_id=user_id,
                     messages=state["messages"],
                     llm=self.llm,
                 )
             )
+            _background_tasks.add(task)
+            task.add_done_callback(_background_tasks.discard)
 
         return {}
 
@@ -442,14 +444,19 @@ class Orchestrator:
 # ===== 全局编排器实例 =====
 
 _orchestrator: Orchestrator | None = None
+_orchestrator_lock = asyncio.Lock()
+_background_tasks: set = set()
 
 
 async def get_orchestrator() -> Orchestrator:
-    """获取全局编排器实例（单例）"""
+    """获取全局编排器实例（单例，并发安全）"""
     global _orchestrator
-    if _orchestrator is None:
-        from src.memory.checkpointer import get_checkpointer
-        checkpointer = await get_checkpointer()
-        _orchestrator = Orchestrator(checkpointer=checkpointer)
-        logger.info("编排器初始化完成")
+    if _orchestrator is not None:
+        return _orchestrator
+    async with _orchestrator_lock:
+        if _orchestrator is None:
+            from src.memory.checkpointer import get_checkpointer
+            checkpointer = await get_checkpointer()
+            _orchestrator = Orchestrator(checkpointer=checkpointer)
+            logger.info("编排器初始化完成")
     return _orchestrator

@@ -1,5 +1,14 @@
 # Task Plan
 
+## Code Quality Fixes (2026-03-22)
+
+- [x] Step 1: Webhook security - defusedxml XXE protection, POST signature verification, shared httpx client + WeChat token TTL cache
+- [x] Step 2: Sandbox + SSRF - AST-based code validator, upload_dir path restriction, SSRF host check, 10MB/20MB size limits
+- [x] Step 3: Data layer bugs - SQL param index bug in is_customer_thread(), checkpointer init try/except + reset, close cleanup
+- [x] Step 4: Concurrency safety - asyncio.Lock double-check on all 5 singletons, fire-and-forget task ref fix in orchestrator
+- [x] Step 5: Input validation - 500 error detail sanitization in routes/streaming, file_id path traversal guard
+- [x] Step 6: Code cleanup - remove dead AgentExecutor/create_tool_calling_agent/\_FallbackAgent code from 3 subagents
+
 - [x] Inspect repository structure, configuration, tests, and recent git history.
 - [x] Draft the contributor-guide outline for this repository.
 - [x] Create `AGENTS.md` with repository-specific guidance.
@@ -198,3 +207,83 @@
   - `python -m pytest tests/test_mode_selector.py tests/test_api.py tests/test_openai_compat.py -q` → `31 passed in 1.78s`
   - `python -m ruff check src/agent/mode_selector.py src/agent/plan_runner.py src/api/routes.py src/api/schemas.py src/api/streaming.py src/api/openai_compat.py src/api/webhooks.py tests/test_mode_selector.py tests/test_api.py tests/test_openai_compat.py` → `All checks passed!`
   - `python -m pytest tests -q` → `67 passed in 2.75s`
+
+## Customer Service Agent And Human Handoff
+
+- [x] Add failing tests for customer-role routing, strict KB-only answering, automatic human handoff, and handoff APIs.
+- [x] Implement customer-service message storage, human handoff persistence, and SQL init/migration scripts.
+- [x] Implement `CustomerServiceSupervisor` and a strict KB-only customer service agent with conservative handoff rules.
+- [x] Wire customer-service routing into sync chat, streaming chat, webhook flows, conversation history, and human handoff APIs.
+- [x] Update docs, task notes, and verification evidence for the customer-service capability.
+
+## Customer Service Agent And Human Handoff Notes
+
+- 2026-03-20: Approved scope is `user_role=customer` for first-party chat APIs, webhook traffic defaults to customer-service routing, and OpenAI-compatible `/v1` stays internal-only for v1.
+- 2026-03-20: Customer-service answers must be strictly grounded in knowledge-base results filtered by `doc_type=customer_service`; empty or low-confidence retrieval must trigger human handoff instead of free-form generation.
+- 2026-03-20: Human handoff is a full lifecycle feature in v1: create pending queue entries, support claim/reply/resolve APIs, persist customer/ai/human/system messages, and suppress further AI replies while a handoff is active.
+- 2026-03-20: Added RED tests in `tests/test_customer_service.py`, `tests/test_api.py`, and `tests/test_db_scripts.py`; initial `python -m pytest tests/test_customer_service.py tests/test_api.py -q` failed with 10 expected failures because `customer` role routing, `CustomerServiceSupervisor`, customer history handling, handoff APIs, and migration SQL did not exist yet.
+- 2026-03-20: Added `src/agent/customer_service.py` with `CustomerServiceSupervisor` and a strict KB-only `CustomerServiceKBAgent`; unresolved or explicit human-request messages now create/refresh handoff records and return the standard transfer message.
+- 2026-03-20: Added `src/memory/customer_service.py`, updated `conversation_metadata` to carry `user_role`, and created `customer_service_messages` / `human_handoffs` in both `scripts/init_db.sql` and `scripts/migrations/2026-03-20-add-customer-service-support.sql`.
+- 2026-03-20: Wired `user_role=customer` into sync chat, WebSocket streaming, conversation history, handoff management APIs, and webhook flows; customer streams now emit only `token/done/error`, while WeCom and default OpenClaw traffic use the customer-service chain.
+- 2026-03-20: Final self-review caught an OpenClaw channel persistence bug; webhook routing now keeps the actual inbound `channel` value when invoking agents, recording conversation metadata, and replying to the upstream API.
+- 2026-03-20: User reported that the frontend still calls `POST /v1/chat/completions`, and sending `转人工` did not enter the customer-service handoff flow. Root cause was that OpenAI compatibility only routed between `orchestrator / plan_runner` and had no customer-service split.
+- 2026-03-20: Added RED coverage in `tests/test_openai_compat.py` for both sync and streaming `/v1/chat/completions` transfer requests. Initial `python -m pytest tests/test_openai_compat.py -q` failed with 2 expected failures because compatibility responses still came from the normal chat route.
+- 2026-03-20: Updated `src/api/openai_compat.py` to support `metadata.user_role` / `metadata.thread_id`, derive a stable compatibility `thread_id`, and route explicit handoff requests plus existing customer-service threads into `CustomerServiceSupervisor`.
+- 2026-03-20: Verified:
+  - `python -m pytest tests/test_customer_service.py tests/test_api.py tests/test_db_scripts.py -q` → `30 passed in 2.07s`
+  - `python -m ruff check src/agent/customer_service.py src/api/routes.py src/api/schemas.py src/api/streaming.py src/api/webhooks.py src/memory/conversations.py src/memory/customer_service.py tests/test_api.py tests/test_customer_service.py tests/test_db_scripts.py` → `All checks passed!`
+  - `python -m pytest tests -q` → `78 passed in 2.76s`
+
+## Deep Agents Standard-First Policy
+
+- [x] Record the repository-level rule that new agent capabilities must check Deep Agents official standards first.
+- [x] Update long-lived project guidance so future implementations default to official Deep Agents mechanisms over custom systems.
+- [x] Capture the policy as an engineering lesson to prevent future parallel ad-hoc abstractions.
+- [x] Verify the documentation changes are clean and consistent.
+
+## Deep Agents Standard-First Policy Notes
+
+- 2026-03-20: Confirmed current repository behavior is mixed: Deep Agents is used for `plan_runner`, but the repository does not use the official `skills=[...]` integration path for most skill-like assets.
+- 2026-03-20: Added a repository rule to `AGENTS.md` requiring future work on skills, planning, orchestration, memory, handoff, or multi-agent behavior to check Deep Agents official capabilities first and prefer the standard mechanism by default.
+- 2026-03-20: Added a matching lesson to `tasks/lessons.md` so future changes do not drift back toward custom parallel systems without an explicit documented gap analysis.
+
+## Deep Agents Skill Integration
+
+- [x] Add RED tests that require `DeepPlanRunner` to wire official Deep Agents `skills=[...]`.
+- [x] Standardize all `src/skills/*/SKILL.md` files to valid Agent Skills frontmatter.
+- [x] Scope the Deep Agents filesystem backend safely so plan mode only exposes the intended project skill source.
+- [x] Preserve existing `data-analysis` store-diagnosis behavior and verify no chat-path regressions.
+- [x] Run targeted and full regression checks, then record the Deep Agents alignment notes.
+
+## Deep Agents Skill Integration Notes
+
+- 2026-03-20: Confirmed the local installed `deepagents==0.4.11` already supports the official `skills=[...]` parameter on `create_deep_agent(...)`, so this task should use the standard middleware path instead of adding a parallel custom skill registry.
+- 2026-03-20: Added RED tests in `tests/test_plan_runner.py` and `tests/test_skill_metadata.py`; initial runs failed because `DeepPlanRunner` did not pass `skills`, and three `SKILL.md` files lacked YAML frontmatter while `data-analysis` used a non-compliant `name`.
+- 2026-03-20: Updated `src/agent/plan_runner.py` to pass `skills=["/skills"]` and a `FilesystemBackend(root_dir=<repo>/src, virtual_mode=True)`, which keeps Deep Agents file operations scoped to `src/` and avoids the default non-virtual path behavior.
+- 2026-03-20: Standardized all four skill docs under `src/skills/*/SKILL.md` to valid Agent Skills frontmatter with `name == directory name` and non-empty `description`.
+- 2026-03-20: Preserved the existing `src/subagents/data_analysis.py` diagnosis-specific prompt injection for chat/data-analysis flows; the Deep Agents skill integration added here applies to `plan_runner` only.
+- 2026-03-20: Verified:
+  - `python -m pytest tests/test_plan_runner.py tests/test_skill_metadata.py -q` → `2 passed in 0.74s`
+  - `python -m ruff check src/agent/plan_runner.py tests/test_plan_runner.py tests/test_skill_metadata.py` → `All checks passed!`
+  - `git diff --check` → clean
+  - `python -m pytest tests -q` → `82 passed in 3.86s`
+
+## Subagent Skill Alignment
+
+- [x] Write the implementation plan for aligning non-plan subagents to the shared skill assets.
+- [x] Add RED tests that require knowledge-base and content-generation prompts to load skill documents from `src/skills`.
+- [x] Introduce a shared runtime skill loader so subagents use the same skill asset source as plan mode.
+- [x] Refactor knowledge-base and content-generation agents to build prompts from their skill docs plus shared private-domain-ops context.
+- [x] Preserve existing data-analysis diagnosis behavior and verify targeted plus full regressions.
+
+## Subagent Skill Alignment Notes
+
+- 2026-03-20: Deep Agents 官方 `skills=[...]` 已用于 `plan_runner`，但 `knowledge-base` 与 `content-generation` 仍使用硬编码 prompt；第二阶段的目标是让这些非 deepagents 子智能体至少复用同一份 `src/skills` 资产，而不是继续分叉维护。
+- 2026-03-20: Added RED tests in `tests/test_content_agent.py` and `tests/test_kb_agent.py`; initial run failed because `build_content_generation_system_prompt()` and `build_kb_system_prompt()` did not exist.
+- 2026-03-20: Added `src/skills/runtime.py` as a minimal cached loader for local skill assets. It intentionally does not implement a registry or routing layer; it only provides a shared bundle builder for runtime prompt composition.
+- 2026-03-20: Refactored `src/subagents/content_generation.py` to build its system prompt from `private-domain-ops` + `content-generation`, and `src/subagents/knowledge_base.py` to build from `private-domain-ops` + `knowledge-base`.
+- 2026-03-20: Updated `src/subagents/data_analysis.py` to reuse the same loader for the store-diagnosis bundle, while preserving the existing diagnosis trigger and output contract.
+- 2026-03-20: Verified:
+  - `python -m pytest tests/test_content_agent.py tests/test_kb_agent.py -q` → `10 passed in 0.61s`
+  - `python -m ruff check src/skills/runtime.py src/subagents/content_generation.py src/subagents/knowledge_base.py src/subagents/data_analysis.py tests/test_content_agent.py tests/test_kb_agent.py` → `All checks passed!`
+  - `python -m pytest tests -q` → `84 passed in 2.95s`

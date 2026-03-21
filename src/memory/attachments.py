@@ -55,6 +55,9 @@ def save_attachment_metadata(
 
 def get_attachment_metadata(file_id: str) -> dict[str, Any]:
     """读取单个附件元数据"""
+    import re
+    if not re.fullmatch(r"[a-f0-9]{32}", file_id):
+        raise AttachmentNotFoundError(f"无效的附件 ID: {file_id}")
     metadata_path = _metadata_dir() / f"{file_id}.json"
     if not metadata_path.exists():
         raise AttachmentNotFoundError(f"附件不存在: {file_id}")

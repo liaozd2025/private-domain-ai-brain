@@ -1,7 +1,8 @@
 """内容生成子智能体测试"""
 
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
 
 
 @pytest.fixture
@@ -17,14 +18,12 @@ async def test_content_agent_generates_text(mock_llm):
     agent_mock = AsyncMock()
     agent_mock.ainvoke = AsyncMock(return_value={"output": "🌟 周末限定！买一送一..."})
 
-    with patch("src.subagents.content_generation.AgentExecutor", return_value=agent_mock):
-        with patch("src.subagents.content_generation.create_tool_calling_agent", return_value=MagicMock()):
-            agent = ContentGenerationAgent(llm=mock_llm)
-            agent._agent = agent_mock
+    agent = ContentGenerationAgent(llm=mock_llm)
+    agent._agent = agent_mock
 
-            result = await agent.generate("帮我写一个朋友圈文案")
-            assert isinstance(result, str)
-            assert len(result) > 0
+    result = await agent.generate("帮我写一个朋友圈文案")
+    assert isinstance(result, str)
+    assert len(result) > 0
 
 
 @pytest.mark.asyncio
@@ -41,14 +40,12 @@ async def test_content_agent_role_and_channel_injected(mock_llm):
     agent_mock = AsyncMock()
     agent_mock.ainvoke = AsyncMock(side_effect=capture)
 
-    with patch("src.subagents.content_generation.AgentExecutor", return_value=agent_mock):
-        with patch("src.subagents.content_generation.create_tool_calling_agent", return_value=MagicMock()):
-            agent = ContentGenerationAgent(llm=mock_llm)
-            agent._agent = agent_mock
+    agent = ContentGenerationAgent(llm=mock_llm)
+    agent._agent = agent_mock
 
-            await agent.generate("写个文案", user_role="销售", channel="moments")
-            assert "销售" in captured["input"]
-            assert "moments" in captured["input"]
+    await agent.generate("写个文案", user_role="销售", channel="moments")
+    assert "销售" in captured["input"]
+    assert "moments" in captured["input"]
 
 
 def test_content_tools_load_template():
@@ -77,3 +74,15 @@ def test_get_platform_rules():
 
     result_unknown = get_platform_rules.invoke({"platform": "unknown_platform"})
     assert "可用平台" in result_unknown
+
+
+def test_content_agent_system_prompt_loads_skill_assets():
+    """内容生成 prompt 应从 skill 文档加载专用规则和共享私域知识。"""
+    from src.subagents.content_generation import build_content_generation_system_prompt
+
+    prompt = build_content_generation_system_prompt()
+
+    assert "内容生成技能规范" in prompt
+    assert "私域运营领域知识" in prompt
+    assert "小红书笔记" in prompt
+    assert "私域 GMV" in prompt

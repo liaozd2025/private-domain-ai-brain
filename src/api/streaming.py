@@ -27,6 +27,13 @@ logger = structlog.get_logger(__name__)
 router = APIRouter()
 
 
+async def get_customer_service_supervisor():
+    """获取客服编排器。"""
+    from src.agent.customer_service import get_customer_service_supervisor as _getter
+
+    return await _getter()
+
+
 @router.websocket("/chat/stream")
 async def chat_stream(websocket: WebSocket):
     """WebSocket 流式对话端点"""
@@ -38,6 +45,7 @@ async def chat_stream(websocket: WebSocket):
         from src.agent.orchestrator import get_orchestrator
         orchestrator = await get_orchestrator()
         mode_selector = await get_mode_selector()
+        customer_service_supervisor = await get_customer_service_supervisor()
 
         while True:
             # 接收消息
@@ -71,6 +79,33 @@ async def chat_stream(websocket: WebSocket):
             # 流式输出
             try:
                 resolved_attachments = resolve_attachment_refs(attachments, user_id)
+                if user_role == "customer":
+                    from src.memory.conversations import record_conversation_turn
+
+                    async for token in customer_service_supervisor.stream(
+                        message=message,
+                        thread_id=thread_id,
+                        user_id=user_id,
+                        channel=channel,
+                    ):
+                        await websocket.send_json({"type": "token", "content": token})
+
+                    await websocket.send_json(
+                        {
+                            "type": "done",
+                            "thread_id": thread_id,
+                            "content": "",
+                        }
+                    )
+                    await record_conversation_turn(
+                        thread_id=thread_id,
+                        user_id=user_id,
+                        user_role=user_role,
+                        message=message,
+                        channel=channel,
+                    )
+                    continue
+
                 mode_decision = await mode_selector.resolve_mode(
                     message=message,
                     requested_mode=mode,
@@ -110,6 +145,7 @@ async def chat_stream(websocket: WebSocket):
                     await record_conversation_turn(
                         thread_id=thread_id,
                         user_id=user_id,
+                        user_role=user_role,
                         message=message,
                         channel=channel,
                     )
@@ -137,6 +173,7 @@ async def chat_stream(websocket: WebSocket):
                     await record_conversation_turn(
                         thread_id=thread_id,
                         user_id=user_id,
+                        user_role=user_role,
                         message=message,
                         channel=channel,
                     )
@@ -145,13 +182,13 @@ async def chat_stream(websocket: WebSocket):
                 await websocket.send_json({"type": "error", "content": str(e)})
             except Exception as e:
                 logger.error("流式处理失败", error=str(e))
-                await websocket.send_json({"type": "error", "content": f"处理失败: {str(e)}"})
+                await websocket.send_json({"type": "error", "content": "处理失败，请稍后重试"})
 
     except WebSocketDisconnect:
         logger.info("WebSocket 连接断开")
     except Exception as e:
         logger.error("WebSocket 异常", error=str(e))
         try:
-            await websocket.send_json({"type": "error", "content": str(e)})
+            await websocket.send_json({"type": "error", "content": "连接异常，请重新连接"})
         except Exception:
             pass

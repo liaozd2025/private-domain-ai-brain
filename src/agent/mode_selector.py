@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from typing import Literal
 
@@ -189,11 +190,15 @@ class ModeSelector:
 
 
 _mode_selector: ModeSelector | None = None
+_mode_selector_lock = asyncio.Lock()
 
 
 async def get_mode_selector() -> ModeSelector:
     global _mode_selector
-    if _mode_selector is None:
-        _mode_selector = ModeSelector()
-        logger.info("Mode selector 初始化完成")
+    if _mode_selector is not None:
+        return _mode_selector
+    async with _mode_selector_lock:
+        if _mode_selector is None:
+            _mode_selector = ModeSelector()
+            logger.info("Mode selector 初始化完成")
     return _mode_selector

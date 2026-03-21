@@ -143,20 +143,15 @@ async def test_data_analysis_agent(sample_csv):
         return_value={"output": "分析报告：门店B销售额最高，达80000元。"}
     )
 
-    with patch("src.subagents.data_analysis.AgentExecutor", return_value=agent_mock):
-        with patch(
-            "src.subagents.data_analysis.create_tool_calling_agent",
-            return_value=MagicMock(),
-        ):
-            da = DataAnalysisAgent(llm=mock_llm)
-            da._agent = agent_mock
+    da = DataAnalysisAgent(llm=mock_llm)
+    da._agent = agent_mock
 
-            result = await da.analyze(
-                query="哪个门店销售额最高",
-                attachments=[{"filename": "sales_data.csv", "file_path": sample_csv}],
-            )
-            assert isinstance(result, str)
-            assert len(result) > 0
-            # 验证文件路径被注入请求
-            call_input = agent_mock.ainvoke.call_args[0][0]["input"]
-            assert sample_csv in call_input
+    result = await da.analyze(
+        query="哪个门店销售额最高",
+        attachments=[{"filename": "sales_data.csv", "file_path": sample_csv}],
+    )
+    assert isinstance(result, str)
+    assert len(result) > 0
+    # 验证文件路径被注入请求
+    call_input = agent_mock.ainvoke.call_args[0][0]["input"]
+    assert sample_csv in call_input

@@ -6,10 +6,12 @@
   - 支持多平台适配（朋友圈/抖音/小红书/企微）
 """
 
+from functools import lru_cache
+
 import structlog
-from langchain_core.messages import HumanMessage, SystemMessage
 
 from src.agent.runtime import ModernToolAgent
+from src.skills.runtime import build_skill_bundle
 from src.tools.content_tools import (
     get_brand_guidelines,
     get_platform_rules,
@@ -18,9 +20,6 @@ from src.tools.content_tools import (
 )
 
 logger = structlog.get_logger(__name__)
-
-AgentExecutor = None
-create_tool_calling_agent = None
 
 
 CONTENT_AGENT_TOOLS = [
@@ -31,7 +30,7 @@ CONTENT_AGENT_TOOLS = [
 ]
 
 
-CONTENT_AGENT_SYSTEM_PROMPT = """
+BASE_CONTENT_AGENT_SYSTEM_PROMPT = """
 你是一个私域运营内容创作专家，专注于帮助私域运营团队生成高质量内容。
 
 ## 工作流程
@@ -63,6 +62,21 @@ CONTENT_AGENT_SYSTEM_PROMPT = """
 """
 
 
+@lru_cache(maxsize=1)
+def build_content_generation_system_prompt() -> str:
+    """构造内容生成运行时提示词。"""
+    skill_bundle = build_skill_bundle(("private-domain-ops", "content-generation"))
+    return (
+        BASE_CONTENT_AGENT_SYSTEM_PROMPT
+        + "\n\n## Runtime Skills\n\n"
+        + "下方是当前项目启用的 skill 资料。生成内容时，必须优先遵循这些规则、模板和领域知识。\n\n"
+        + skill_bundle
+    )
+
+
+CONTENT_AGENT_SYSTEM_PROMPT = build_content_generation_system_prompt()
+
+
 class ContentGenerationAgent:
     """内容生成子智能体"""
 
@@ -71,24 +85,6 @@ class ContentGenerationAgent:
         self._agent = self._create_agent()
 
     def _create_agent(self):
-        if AgentExecutor is not None and create_tool_calling_agent is not None:
-            from langchain_core.prompts import ChatPromptTemplate
-
-            prompt = ChatPromptTemplate.from_messages([
-                ("system", CONTENT_AGENT_SYSTEM_PROMPT),
-                ("human", "{input}"),
-                ("placeholder", "{agent_scratchpad}"),
-            ])
-
-            agent = create_tool_calling_agent(self.llm, CONTENT_AGENT_TOOLS, prompt)
-            return AgentExecutor(
-                agent=agent,
-                tools=CONTENT_AGENT_TOOLS,
-                verbose=False,
-                max_iterations=5,
-                handle_parsing_errors=True,
-            )
-
         return ModernToolAgent(
             self.llm,
             CONTENT_AGENT_TOOLS,
@@ -128,17 +124,3 @@ class ContentGenerationAgent:
             )
 
 
-class _FallbackContentAgent:
-    """在缺少 legacy agent API 时的最小可用实现"""
-
-    def __init__(self, llm):
-        self.llm = llm
-
-    async def ainvoke(self, payload: dict) -> dict:
-        response = await self.llm.ainvoke(
-            [
-                SystemMessage(content=CONTENT_AGENT_SYSTEM_PROMPT),
-                HumanMessage(content=payload.get("input", "")),
-            ]
-        )
-        return {"output": getattr(response, "content", str(response))}

@@ -22,6 +22,12 @@ from src.api.schemas import (
     ConversationRenameRequest,
     ConversationSummary,
     FileUploadResponse,
+    HandoffClaimRequest,
+    HandoffDetail,
+    HandoffListResponse,
+    HandoffReplyRequest,
+    HandoffResolveRequest,
+    HandoffSummary,
     HealthResponse,
     MessageItem,
     UserProfile,
@@ -59,6 +65,32 @@ async def get_mode_selector_dep():
     return await get_mode_selector()
 
 
+async def get_customer_service_supervisor_dep():
+    """获取客服编排器依赖。"""
+    from src.agent.customer_service import get_customer_service_supervisor
+    return await get_customer_service_supervisor()
+
+
+async def get_customer_service_store_dep():
+    """获取客服存储依赖。"""
+    from src.memory.customer_service import get_customer_service_store
+    return get_customer_service_store()
+
+
+def _is_customer_role(user_role: str) -> bool:
+    return user_role == "customer"
+
+
+def _customer_sender_to_role(sender_type: str) -> str:
+    mapping = {
+        "customer": "user",
+        "ai": "assistant",
+        "human": "human",
+        "system": "system",
+    }
+    return mapping.get(sender_type, "assistant")
+
+
 # ===== 聊天端点 =====
 
 @router.post("/chat", response_model=ChatResponse)
@@ -67,6 +99,7 @@ async def chat(
     orchestrator=Depends(get_orchestrator_dep),
     plan_runner=Depends(get_plan_runner_dep),
     mode_selector=Depends(get_mode_selector_dep),
+    customer_service_supervisor=Depends(get_customer_service_supervisor_dep),
 ):
     """发送消息，获取 AI 回答（同步模式）
 
@@ -87,6 +120,31 @@ async def chat(
             [a.model_dump() for a in request.attachments],
             request.user_id,
         )
+
+        if _is_customer_role(request.user_role):
+            result = await customer_service_supervisor.invoke(
+                message=request.message,
+                thread_id=thread_id,
+                user_id=request.user_id,
+                channel=request.channel,
+            )
+            from src.memory.conversations import record_conversation_turn
+
+            await record_conversation_turn(
+                thread_id=thread_id,
+                user_id=request.user_id,
+                user_role=request.user_role,
+                message=request.message,
+                channel=request.channel,
+            )
+            return ChatResponse(
+                thread_id=thread_id,
+                message_id=f"msg_{uuid.uuid4().hex[:12]}",
+                content=result.content,
+                mode="chat",
+                requested_mode=request.mode,
+                resolved_mode="chat",
+            )
 
         mode_decision = await mode_selector.resolve_mode(
             message=request.message,
@@ -111,6 +169,7 @@ async def chat(
             await record_conversation_turn(
                 thread_id=thread_id,
                 user_id=request.user_id,
+                user_role=request.user_role,
                 message=request.message,
                 channel=request.channel,
             )
@@ -139,6 +198,7 @@ async def chat(
         await record_conversation_turn(
             thread_id=thread_id,
             user_id=request.user_id,
+            user_role=request.user_role,
             message=request.message,
             channel=request.channel,
         )
@@ -158,7 +218,7 @@ async def chat(
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error("聊天请求失败", error=str(e), thread_id=thread_id)
-        raise HTTPException(status_code=500, detail=f"处理失败: {str(e)}")
+        raise HTTPException(status_code=500, detail="请求处理失败，请稍后重试")
 
 
 # ===== 文件上传 =====
@@ -264,6 +324,7 @@ async def get_conversation(
     thread_id: str,
     limit: int = 50,
     user_id: str | None = None,
+    customer_service_store=Depends(get_customer_service_store_dep),
 ):
     """获取对话历史"""
     try:
@@ -276,10 +337,38 @@ async def get_conversation(
             user_id=user_id,
             include_deleted=True,
         )
-        if user_id and metadata is None:
+        is_customer_thread = await customer_service_store.is_customer_thread(
+            thread_id,
+            user_id=user_id,
+        )
+        if user_id and metadata is None and not is_customer_thread:
             raise HTTPException(status_code=404, detail="对话不存在")
         if metadata and metadata["is_deleted"]:
             raise HTTPException(status_code=404, detail="对话不存在")
+        if is_customer_thread:
+            message_rows = await customer_service_store.get_thread_messages(
+                thread_id,
+                user_id=user_id,
+                limit=limit,
+            )
+            message_items = [
+                MessageItem(
+                    role=_customer_sender_to_role(item["sender_type"]),
+                    content=item["content"],
+                    created_at=item.get("created_at"),
+                )
+                for item in message_rows
+            ]
+            return ConversationHistory(
+                thread_id=thread_id,
+                title=metadata["title"] if metadata else None,
+                channel=metadata["channel"] if metadata else None,
+                created_at=metadata["created_at"] if metadata else None,
+                last_message_at=metadata["last_message_at"] if metadata else None,
+                message_count=metadata["message_count"] if metadata else len(message_items),
+                messages=message_items,
+                total=len(message_items),
+            )
 
         checkpointer = await get_checkpointer()
 
@@ -317,7 +406,7 @@ async def get_conversation(
         raise
     except Exception as e:
         logger.error("获取对话历史失败", thread_id=thread_id, error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="获取对话历史失败，请稍后重试")
 
 
 @router.patch("/conversations/{thread_id}", response_model=ConversationSummary)
@@ -346,6 +435,104 @@ async def delete_conversation(thread_id: str, user_id: str):
     if not deleted:
         raise HTTPException(status_code=404, detail="对话不存在")
     return Response(status_code=204)
+
+
+@router.get("/handoffs", response_model=HandoffListResponse)
+async def list_handoffs(
+    status: str | None = None,
+    channel: str | None = None,
+    limit: int = 20,
+    offset: int = 0,
+    customer_service_store=Depends(get_customer_service_store_dep),
+):
+    """获取人工接管队列。"""
+    result = await customer_service_store.list_handoffs(
+        status=status,
+        channel=channel,
+        limit=limit,
+        offset=offset,
+    )
+    return HandoffListResponse(
+        items=[HandoffSummary(**item) for item in result["items"]],
+        total=result["total"],
+    )
+
+
+@router.get("/handoffs/{handoff_id}", response_model=HandoffDetail)
+async def get_handoff_detail(
+    handoff_id: str,
+    customer_service_store=Depends(get_customer_service_store_dep),
+):
+    """获取人工接管详情。"""
+    detail = await customer_service_store.get_handoff_detail(handoff_id)
+    if not detail:
+        raise HTTPException(status_code=404, detail="接管记录不存在")
+    return HandoffDetail(**detail)
+
+
+@router.post("/handoffs/{handoff_id}/claim", response_model=HandoffSummary)
+async def claim_handoff(
+    handoff_id: str,
+    request: HandoffClaimRequest,
+    customer_service_store=Depends(get_customer_service_store_dep),
+):
+    """人工领取会话。"""
+    handoff = await customer_service_store.claim_handoff(
+        handoff_id=handoff_id,
+        agent_id=request.agent_id,
+    )
+    if not handoff:
+        raise HTTPException(status_code=404, detail="接管记录不存在")
+    return HandoffSummary(**handoff)
+
+
+@router.post("/handoffs/{handoff_id}/reply", response_model=HandoffSummary)
+async def reply_handoff(
+    handoff_id: str,
+    request: HandoffReplyRequest,
+    customer_service_store=Depends(get_customer_service_store_dep),
+):
+    """人工回复客户。"""
+    handoff = await customer_service_store.reply_to_handoff(
+        handoff_id=handoff_id,
+        agent_id=request.agent_id,
+        content=request.content,
+        resolve_after_reply=request.resolve_after_reply,
+    )
+    if not handoff:
+        raise HTTPException(status_code=404, detail="接管记录不存在")
+
+    if handoff["channel"] == "wecom":
+        from src.api.webhooks import send_wecom_message
+
+        await send_wecom_message(to_user=handoff["user_id"], content=request.content)
+    elif handoff["channel"] == "openclaw":
+        from src.api.webhooks import send_openclaw_message
+
+        await send_openclaw_message(
+            user_id=handoff["user_id"],
+            channel=handoff["channel"],
+            content=request.content,
+        )
+
+    return HandoffSummary(**handoff)
+
+
+@router.post("/handoffs/{handoff_id}/resolve", response_model=HandoffSummary)
+async def resolve_handoff(
+    handoff_id: str,
+    request: HandoffResolveRequest,
+    customer_service_store=Depends(get_customer_service_store_dep),
+):
+    """结束人工接管。"""
+    handoff = await customer_service_store.resolve_handoff(
+        handoff_id=handoff_id,
+        agent_id=request.agent_id,
+        resolution_note=request.resolution_note,
+    )
+    if not handoff:
+        raise HTTPException(status_code=404, detail="接管记录不存在")
+    return HandoffSummary(**handoff)
 
 
 # ===== 用户画像 =====
