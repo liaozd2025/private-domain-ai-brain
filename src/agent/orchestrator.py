@@ -36,6 +36,7 @@ class OrchestratorState(MessagesState):
     user_id: str
     user_role: str                     # 门店老板 / 销售 / 店长 / 总部市场
     channel: str                       # web / wecom / openclaw
+    store_id: str | None               # 门店 ID，预留给后续外部数据能力
     query_type: str | None             # 路由分类结果
     subagent_result: str | None        # 子智能体返回结果
     attachments: list[dict]            # 上传文件信息
@@ -213,24 +214,34 @@ class Orchestrator:
         last_message = state["messages"][-1]
         query = last_message.content if hasattr(last_message, "content") else str(last_message)
 
-        # 获取对话上下文摘要（最近 3 轮）
+        # 获取对话上下文摘要（最近 3 轮，每条截断 200 字符保留足够语义）
         recent_messages = state["messages"][-6:-1]  # 排除最新消息
         context = " | ".join([
-            f"{'用户' if isinstance(m, HumanMessage) else 'AI'}: {str(m.content)[:50]}"
+            f"{'用户' if isinstance(m, HumanMessage) else 'AI'}: {str(m.content)[:200]}"
             for m in recent_messages
         ])
 
+        attachments = state.get("attachments", [])
         decision: RouterDecision = await self.router.classify(
             query,
             context,
-            attachments=state.get("attachments", []),
+            attachments=attachments,
         )
+
+        # 低置信度兜底：避免错误路由到重型子智能体
+        if decision.confidence < 0.6:
+            logger.warning(
+                "路由置信度过低，降级为 chitchat",
+                original_type=decision.query_type,
+                confidence=decision.confidence,
+            )
+            return {"query_type": QueryType.CHITCHAT.value}
 
         return {"query_type": decision.query_type.value}
 
     def _routing_condition(self, state: OrchestratorState) -> str:
         """路由条件边"""
-        return state.get("query_type", QueryType.CHITCHAT)
+        return state.get("query_type", QueryType.CHITCHAT.value)
 
     async def _chitchat_node(self, state: OrchestratorState) -> dict:
         """闲聊节点 - 直接 LLM 回答，不查知识库"""
@@ -274,7 +285,7 @@ class Orchestrator:
         last_message = state["messages"][-1]
         query = last_message.content if hasattr(last_message, "content") else str(last_message)
 
-        da_agent = DataAnalysisAgent(llm=self.llm)
+        da_agent = DataAnalysisAgent(llm=self.llm, vision_llm=self.vision_llm)
         result = await da_agent.analyze(
             query=query,
             attachments=state.get("attachments", []),
@@ -383,6 +394,7 @@ class Orchestrator:
         user_id: str,
         user_role: str = "unknown",
         channel: str = "web",
+        store_id: str | None = None,
         attachments: list[dict] = None,
     ) -> str:
         """调用编排器处理单条消息"""
@@ -396,6 +408,7 @@ class Orchestrator:
             "user_id": user_id,
             "user_role": user_role,
             "channel": channel,
+            "store_id": store_id,
             "query_type": None,
             "subagent_result": None,
             "attachments": attachments or [],
@@ -412,6 +425,7 @@ class Orchestrator:
         user_id: str,
         user_role: str = "unknown",
         channel: str = "web",
+        store_id: str | None = None,
         attachments: list[dict] = None,
     ) -> AsyncGenerator[str, None]:
         """流式调用编排器"""
@@ -425,6 +439,7 @@ class Orchestrator:
             "user_id": user_id,
             "user_role": user_role,
             "channel": channel,
+            "store_id": store_id,
             "query_type": None,
             "subagent_result": None,
             "attachments": attachments or [],

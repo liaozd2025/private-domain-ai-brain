@@ -13,7 +13,10 @@ import traceback
 from functools import lru_cache
 from pathlib import Path
 
+import base64
+
 import structlog
+from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
 
 from src.agent.runtime import ModernToolAgent
@@ -362,12 +365,49 @@ def build_data_analysis_system_prompt(
     )
 
 
+# Official Deep Agents SubAgent spec — use with create_deep_agent(subagents=[...]).
+# The data-analysis SKILL.md already embeds store-diagnosis rules, thresholds, and output
+# templates, so no dynamic prompt switching is needed when using the SubAgent path.
+DATA_ANALYSIS_SUBAGENT: dict = {
+    "name": "data-analysis",
+    "description": (
+        "Use to analyze uploaded CSV or Excel data files. "
+        "Supports general data analysis, trend analysis, chart generation, "
+        "and 美容门店五大指标 (beauty store five-key-metric) performance diagnosis. "
+        "Include the file paths and analysis goal in the task description."
+    ),
+    "tools": DA_AGENT_TOOLS,
+    "system_prompt": BASE_DA_AGENT_SYSTEM_PROMPT,
+    "skills": ["/skills/data-analysis"],
+}
+
+
+_IMAGE_MIME = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp"}
+
+
 class DataAnalysisAgent:
     """数据分析子智能体"""
 
-    def __init__(self, llm):
+    def __init__(self, llm, vision_llm=None):
         self.llm = llm
+        self.vision_llm = vision_llm
         self._agent = self._create_agent()
+
+    async def _extract_image_data(self, attachment: dict) -> str:
+        """用 vision LLM 提取图片中的数据文本，供后续分析使用"""
+        file_path = attachment.get("file_path", "")
+        if not file_path or not Path(file_path).exists():
+            return "（图片文件不存在）"
+        suffix = Path(file_path).suffix.lower().lstrip(".")
+        mime = _IMAGE_MIME.get(suffix, "image/png")
+        with open(file_path, "rb") as f:
+            encoded = base64.b64encode(f.read()).decode()
+        msg = HumanMessage(content=[
+            {"type": "text", "text": "请识别图片中所有数据、表格、指标数值，以结构化文本格式输出，便于后续数据分析使用。"},
+            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}},
+        ])
+        resp = await self.vision_llm.ainvoke([msg])
+        return resp.content
 
     def _create_agent(self, system_prompt: str = BASE_DA_AGENT_SYSTEM_PROMPT):
         return ModernToolAgent(
@@ -394,19 +434,45 @@ class DataAnalysisAgent:
         Returns:
             分析报告
         """
-        # 构建包含文件路径的请求
-        enriched_query = query
-        if attachments:
-            file_info = "\n".join([
-                f"- {a.get('filename', '未知文件')}: {a.get('file_path', '')}"
-                for a in attachments
-            ])
-            enriched_query = f"[可用数据文件]:\n{file_info}\n\n[分析请求]: {query}"
-
-        if user_role != "unknown":
-            enriched_query = f"[用户角色: {user_role}]\n{enriched_query}"
-
         try:
+            # 图片附件 → 先用 vision LLM 提取数据文本
+            image_descriptions = []
+            if attachments and self.vision_llm:
+                for att in attachments:
+                    if att.get("file_type") == "image":
+                        logger.info("提取图片数据", filename=att.get("filename", ""))
+                        try:
+                            desc = await self._extract_image_data(att)
+                            image_descriptions.append(
+                                f"[图片数据 - {att.get('filename', '')}]:\n{desc}"
+                            )
+                        except Exception as img_err:
+                            logger.warning(
+                                "图片数据提取失败，跳过视觉分析",
+                                filename=att.get("filename", ""),
+                                error=str(img_err),
+                                exc_info=True,
+                            )
+                            image_descriptions.append(
+                                f"[图片 {att.get('filename', '')} 无法识别，请直接描述图中数据]"
+                            )
+
+            # 构建包含文件路径的请求（表格文件）
+            enriched_query = query
+            tabular_attachments = [a for a in (attachments or []) if a.get("file_type") != "image"]
+            if tabular_attachments:
+                file_info = "\n".join([
+                    f"- {a.get('filename', '未知文件')}: {a.get('file_path', '')}"
+                    for a in tabular_attachments
+                ])
+                enriched_query = f"[可用数据文件]:\n{file_info}\n\n[分析请求]: {query}"
+
+            if image_descriptions:
+                enriched_query = "\n\n".join(image_descriptions) + f"\n\n[分析请求]: {enriched_query}"
+
+            if user_role != "unknown":
+                enriched_query = f"[用户角色: {user_role}]\n{enriched_query}"
+
             system_prompt = build_data_analysis_system_prompt(query, attachments)
             agent = self._agent
             if system_prompt != BASE_DA_AGENT_SYSTEM_PROMPT:
@@ -417,5 +483,5 @@ class DataAnalysisAgent:
             logger.info("数据分析完成", query=query[:50], report_length=len(report))
             return report
         except Exception as e:
-            logger.error("数据分析失败", error=str(e))
+            logger.error("数据分析失败", error=str(e), exc_info=True)
             return f"数据分析遇到问题: {str(e)}"

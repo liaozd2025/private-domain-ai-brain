@@ -86,3 +86,45 @@ def resolve_attachment_ref(ref: dict[str, Any], user_id: str) -> dict[str, Any]:
 def resolve_attachment_refs(refs: list[dict[str, Any]], user_id: str) -> list[dict[str, Any]]:
     """批量解析附件引用"""
     return [resolve_attachment_ref(ref, user_id) for ref in refs]
+
+
+async def resolve_attachment_refs_from_db(
+    refs: list[dict[str, Any]],
+    user_id: str,
+) -> list[dict[str, Any]]:
+    """从 uploaded_files 表解析附件引用，找不到时 fallback 到文件系统 JSON。"""
+    from sqlalchemy import select
+
+    from src.memory.db import get_async_engine, uploaded_files_table
+
+    results = []
+    async with get_async_engine().connect() as conn:
+        for ref in refs:
+            file_id = ref.get("file_id", "").strip()
+            if not file_id:
+                raise AttachmentNotFoundError("附件缺少 file_id")
+
+            row = (
+                await conn.execute(
+                    select(uploaded_files_table).where(
+                        uploaded_files_table.c.file_id == file_id
+                    )
+                )
+            ).mappings().first()
+
+            if row is None:
+                # fallback：兼容 DB 写入前的历史上传
+                metadata = get_attachment_metadata(file_id)
+                if metadata.get("user_id") and metadata["user_id"] != user_id:
+                    raise AttachmentAccessError(f"无权访问附件: {file_id}")
+            else:
+                metadata = dict(row)
+                if metadata.get("user_id") and metadata["user_id"] != user_id:
+                    raise AttachmentAccessError(f"无权访问附件: {file_id}")
+
+            file_path = metadata.get("file_path", "")
+            if not file_path or not Path(file_path).exists():
+                raise AttachmentNotFoundError(f"附件文件不存在或已被删除: {file_id}")
+
+            results.append(metadata)
+    return results
