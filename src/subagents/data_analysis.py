@@ -7,13 +7,13 @@
   - 输出分析报告
 """
 
+import base64
+import importlib
 import os
 import textwrap
 import traceback
 from functools import lru_cache
 from pathlib import Path
-
-import base64
 
 import structlog
 from langchain_core.messages import HumanMessage
@@ -137,6 +137,41 @@ def run_python_analysis(code: str, file_path: str | None = None) -> str:
     _safe_pd.read_csv = _safe_read_csv
     _safe_pd.read_excel = _safe_read_excel
 
+    def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if level != 0:
+            raise ImportError("不允许相对导入")
+
+        module_name = str(name)
+        top_level = module_name.split(".")[0]
+        if module_name not in ALLOWED_IMPORTS and top_level not in ALLOWED_IMPORTS:
+            raise ImportError(f"不允许导入模块: {module_name}")
+
+        if module_name == "pandas":
+            return _safe_pd
+        if module_name == "numpy":
+            return np
+        if module_name == "matplotlib.pyplot":
+            return plt
+        if module_name == "matplotlib":
+            safe_matplotlib = _types.ModuleType("matplotlib")
+            safe_matplotlib.__dict__.update(vars(matplotlib))
+            safe_matplotlib.pyplot = plt
+            return safe_matplotlib
+
+        imported = importlib.import_module(module_name)
+        if module_name.startswith("plotly"):
+            return imported
+        if module_name.startswith("scipy"):
+            return imported
+
+        if top_level == "matplotlib":
+            safe_matplotlib = _types.ModuleType("matplotlib")
+            safe_matplotlib.__dict__.update(vars(matplotlib))
+            safe_matplotlib.pyplot = plt
+            return safe_matplotlib
+
+        return imported
+
     sandbox_globals = {
         "pd": _safe_pd,
         "np": np,
@@ -159,6 +194,7 @@ def run_python_analysis(code: str, file_path: str | None = None) -> str:
             "min": min,
             "sorted": sorted,
             "abs": abs,
+            "__import__": _safe_import,
         },
     }
 
@@ -282,7 +318,10 @@ BASE_DA_AGENT_SYSTEM_PROMPT = (
     "5. **输出报告**：给出清晰的分析结论和建议\n\n"
     "## 分析代码规范\n\n"
     "通过 run_python_analysis 工具传入 Python 代码，数据文件通过 file_path 参数指定。\n"
-    "代码中使用 df 变量访问数据，分析结果赋值给 result 变量（字符串格式）。\n\n"
+    "代码中使用 df 变量访问数据，分析结果赋值给 result 变量（字符串格式）。\n"
+    "运行环境已预置 pd / np / plt，不要重复 import pandas、numpy、matplotlib。\n"
+    "不要在代码里硬编码 pd.read_excel('/app/uploads/...') 或 pd.read_csv('/app/uploads/...')，"
+    "应把文件路径通过 run_python_analysis 的 file_path 参数传入，由工具自动加载 df。\n\n"
     "示例：store_sales = df.groupby('门店名称')['销售额'].sum().sort_values(ascending=False)\n"
     "result = '门店分析: ' + store_sales.to_string()\n\n"
     "## 输出规范\n\n"
@@ -366,8 +405,8 @@ def build_data_analysis_system_prompt(
 
 
 # Official Deep Agents SubAgent spec — use with create_deep_agent(subagents=[...]).
-# The data-analysis SKILL.md already embeds store-diagnosis rules, thresholds, and output
-# templates, so no dynamic prompt switching is needed when using the SubAgent path.
+# Skill 动态加载由 Deep Agents 引擎通过 skills=["/skills/data-analysis"] 自动处理，
+# 不再在 system_prompt 里手工拼接 SKILL.md + references 内容。
 DATA_ANALYSIS_SUBAGENT: dict = {
     "name": "data-analysis",
     "description": (
@@ -402,10 +441,18 @@ class DataAnalysisAgent:
         mime = _IMAGE_MIME.get(suffix, "image/png")
         with open(file_path, "rb") as f:
             encoded = base64.b64encode(f.read()).decode()
-        msg = HumanMessage(content=[
-            {"type": "text", "text": "请识别图片中所有数据、表格、指标数值，以结构化文本格式输出，便于后续数据分析使用。"},
-            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}},
-        ])
+        msg = HumanMessage(
+            content=[
+                {
+                    "type": "text",
+                    "text": (
+                        "请识别图片中所有数据、表格、指标数值，"
+                        "以结构化文本格式输出，便于后续数据分析使用。"
+                    ),
+                },
+                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}},
+            ]
+        )
         resp = await self.vision_llm.ainvoke([msg])
         return resp.content
 
@@ -468,7 +515,9 @@ class DataAnalysisAgent:
                 enriched_query = f"[可用数据文件]:\n{file_info}\n\n[分析请求]: {query}"
 
             if image_descriptions:
-                enriched_query = "\n\n".join(image_descriptions) + f"\n\n[分析请求]: {enriched_query}"
+                enriched_query = (
+                    "\n\n".join(image_descriptions) + f"\n\n[分析请求]: {enriched_query}"
+                )
 
             if user_role != "unknown":
                 enriched_query = f"[用户角色: {user_role}]\n{enriched_query}"

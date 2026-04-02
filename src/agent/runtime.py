@@ -8,6 +8,7 @@ from typing import Any
 from langchain.agents import create_agent
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.tools import BaseTool
+from langgraph.errors import GraphRecursionError
 
 
 def extract_text_from_message(message: BaseMessage | Any) -> str:
@@ -32,15 +33,30 @@ def extract_text_from_state(result: dict[str, Any]) -> str:
     messages = result.get("messages", [])
     for message in reversed(messages):
         if isinstance(message, AIMessage):
-            return extract_text_from_message(message)
+            text = extract_text_from_message(message).strip()
+            if text:
+                return text
 
-    if messages:
-        return extract_text_from_message(messages[-1])
+    for message in reversed(messages):
+        text = extract_text_from_message(message).strip()
+        if text:
+            return text
 
-    if "output" in result:
+    if "output" in result and str(result["output"]).strip():
         return str(result["output"])
 
     return str(result)
+
+
+def extract_last_ai_text(result: dict[str, Any]) -> str:
+    """仅提取最后一个非空 AI 文本，不回退到 HumanMessage。"""
+    messages = result.get("messages", [])
+    for message in reversed(messages):
+        if isinstance(message, AIMessage):
+            text = extract_text_from_message(message).strip()
+            if text:
+                return text
+    return ""
 
 
 class ModernToolAgent:
@@ -65,8 +81,27 @@ class ModernToolAgent:
 
     async def ainvoke(self, payload: dict[str, Any]) -> dict[str, str]:
         query = payload.get("input", "")
-        result = await self._agent.ainvoke(
-            {"messages": [HumanMessage(content=query)]},
-            config={"recursion_limit": self._recursion_limit},
-        )
-        return {"output": extract_text_from_state(result)}
+        latest_state: dict[str, Any] | None = None
+        try:
+            async for state in self._agent.astream(
+                {"messages": [HumanMessage(content=query)]},
+                config={"recursion_limit": self._recursion_limit},
+                stream_mode="values",
+            ):
+                if isinstance(state, dict):
+                    latest_state = state
+        except GraphRecursionError:
+            if latest_state is not None:
+                partial_output = extract_last_ai_text(latest_state)
+                if partial_output.strip():
+                    return {"output": partial_output}
+            raise
+
+        if latest_state is None:
+            result = await self._agent.ainvoke(
+                {"messages": [HumanMessage(content=query)]},
+                config={"recursion_limit": self._recursion_limit},
+            )
+            return {"output": extract_text_from_state(result)}
+
+        return {"output": extract_text_from_state(latest_state)}

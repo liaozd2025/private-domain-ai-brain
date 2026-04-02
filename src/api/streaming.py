@@ -41,6 +41,7 @@ from src.api.schemas import ChatRequest
 from src.memory.attachments import (
     AttachmentAccessError,
     AttachmentNotFoundError,
+    AttachmentStorageError,
     resolve_attachment_refs_from_db,
 )
 
@@ -105,6 +106,9 @@ async def chat_stream(request: ChatRequest):
             )
         except (AttachmentAccessError, AttachmentNotFoundError) as e:
             yield _sse_event("error", {"content": str(e)})
+            return
+        except AttachmentStorageError:
+            yield _sse_event("error", {"content": "文件存储服务暂时不可用，请稍后重试"})
             return
 
         from src.memory.conversations import get_conversation_store

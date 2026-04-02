@@ -77,6 +77,22 @@ def build_content_generation_system_prompt() -> str:
 CONTENT_AGENT_SYSTEM_PROMPT = build_content_generation_system_prompt()
 
 
+# Official Deep Agents SubAgent spec — use with create_deep_agent(subagents=[CONTENT_SUBAGENT])
+# Skills are loaded by FilesystemBackend at runtime; do NOT bundle them into system_prompt here.
+CONTENT_SUBAGENT: dict = {
+    "name": "content-generation",
+    "description": (
+        "Use to generate private-domain operational content: "
+        "WeChat moments copy, Xiaohongshu posts, Douyin scripts, activity plans, "
+        "sales scripts, customer service templates, and SOPs. "
+        "Include the target platform/channel and user role in the task description."
+    ),
+    "tools": CONTENT_AGENT_TOOLS,
+    "system_prompt": BASE_CONTENT_AGENT_SYSTEM_PROMPT,
+    "skills": ["/skills/content-generation", "/skills/private-domain-ops"],
+}
+
+
 class ContentGenerationAgent:
     """内容生成子智能体"""
 

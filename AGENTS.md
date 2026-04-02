@@ -21,5 +21,13 @@ Use `pytest` and `pytest-asyncio`; mark async tests with `@pytest.mark.asyncio`.
 ## Commit & Pull Request Guidelines
 This repository currently has no commit history, so use Conventional Commits from the start: `feat:`, `fix:`, `docs:`, `test:`, `refactor:`. Keep commits focused on one concern. PRs should summarize the change, list verification commands, note config or schema impacts, and include sample requests, responses, or screenshots when API behavior changes.
 
+## Deep Agents Standard-First Rule
+For any new capability related to planning, skills, agent composition, tool orchestration, memory, handoff, or multi-agent behavior, check the current Deep Agents official docs first before designing a custom implementation.
+
+- If Deep Agents already provides a standard capability, use the official mechanism by default.
+- Only build a custom mechanism when the official capability clearly cannot satisfy the product requirement.
+- When custom behavior is still required, document the gap explicitly in the implementation plan: what official capability was checked, why it was insufficient, and what minimal custom layer is being added.
+- Do not create parallel ad-hoc systems when the same behavior can be expressed through standard Deep Agents primitives.
+
 ## Security & Configuration Tips
 Copy `.env.example` to `.env` and never commit real API keys, database passwords, or webhook secrets. Verify `DATABASE_URL`, `UPLOAD_DIR`, and Milvus settings before local runs. Prefer `docker-compose` for shared development setup, and use `scripts/init_db.sql` when initializing the database manually.

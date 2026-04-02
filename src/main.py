@@ -13,6 +13,29 @@ from src.config import settings
 logger = structlog.get_logger(__name__)
 
 
+def ensure_upload_dir_ready() -> None:
+    """确保上传根目录及 OSS 缓存目录存在且当前进程可写。"""
+    upload_root = Path(settings.upload_dir)
+    upload_root.mkdir(parents=True, exist_ok=True)
+
+    oss_cache_dir = upload_root / "oss_cache"
+    oss_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    probe_file = oss_cache_dir / ".write_probe"
+    try:
+        probe_file.write_bytes(b"")
+    except OSError as exc:
+        raise RuntimeError(
+            f"UPLOAD_DIR 不可写: {upload_root}. "
+            "请检查宿主机挂载目录权限，并确保容器运行用户可写。"
+        ) from exc
+    finally:
+        try:
+            probe_file.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("清理上传目录探针文件失败", path=str(probe_file))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理 - 启动初始化 + 关闭清理"""
@@ -20,7 +43,7 @@ async def lifespan(app: FastAPI):
     logger.info("启动 AI 智脑助手", env=settings.app_env)
 
     # 确保上传目录存在
-    Path(settings.upload_dir).mkdir(parents=True, exist_ok=True)
+    ensure_upload_dir_ready()
 
     # 初始化数据库连接池
     from src.memory.checkpointer import init_checkpointer
@@ -34,7 +57,10 @@ async def lifespan(app: FastAPI):
     # 关闭
     logger.info("正在关闭服务...")
     from src.memory.checkpointer import close_checkpointer
+    from src.memory.db import close_async_engine
+
     await close_checkpointer()
+    await close_async_engine()
     logger.info("服务已关闭")
 
 
@@ -56,15 +82,19 @@ def create_app() -> FastAPI:
     )
 
     # 注册路由
+    from fastapi import Depends
+
+    from src.api.auth import require_auth
     from src.api.openai_compat import router as openai_compat_router
     from src.api.routes import router as api_router
-    from src.api.streaming import router as ws_router
+    from src.api.streaming import router as stream_router
     from src.api.webhooks import router as webhook_router
 
-    app.include_router(openai_compat_router, prefix="/v1")
-    app.include_router(api_router, prefix="/api/v1")
-    app.include_router(ws_router, prefix="/api/v1")
-    app.include_router(webhook_router, prefix="/api/v1/webhooks")
+    _auth = [Depends(require_auth)]
+    app.include_router(openai_compat_router, prefix="/v1", dependencies=_auth)
+    app.include_router(api_router, prefix="/api/v1", dependencies=_auth)
+    app.include_router(stream_router, prefix="/api/v1", dependencies=_auth)
+    app.include_router(webhook_router, prefix="/api/v1/webhooks")  # 自身签名验证，无需 API 认证
 
     # 全局异常处理
     @app.exception_handler(Exception)

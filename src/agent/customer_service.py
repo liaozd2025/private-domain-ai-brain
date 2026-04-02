@@ -110,6 +110,7 @@ class CustomerServiceSupervisor:
         thread_id: str,
         user_id: str,
         channel: str,
+        store_id: str | None = None,
     ) -> CustomerServiceResult:
         active_handoff = await self.handoff_store.get_active_handoff(thread_id)
         if active_handoff:
@@ -172,12 +173,14 @@ class CustomerServiceSupervisor:
         thread_id: str,
         user_id: str,
         channel: str,
+        store_id: str | None = None,
     ) -> AsyncGenerator[str, None]:
         result = await self.invoke(
             message=message,
             thread_id=thread_id,
             user_id=user_id,
             channel=channel,
+            store_id=store_id,
         )
         for token in result.content:
             yield token

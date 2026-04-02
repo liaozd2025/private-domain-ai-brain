@@ -1,3 +1,8 @@
+---
+name: knowledge-base
+description: Use when answering private-domain operations questions from the knowledge base, selecting retrieval patterns, filtering by doc_type, and producing citation-grounded answers or no-result responses.
+---
+
 # 知识库技能规范 (SKILL.md)
 
 ## 知识库结构

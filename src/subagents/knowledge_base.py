@@ -61,6 +61,22 @@ def build_kb_system_prompt() -> str:
 KB_AGENT_SYSTEM_PROMPT = build_kb_system_prompt()
 
 
+# Official Deep Agents SubAgent spec — use with create_deep_agent(subagents=[KB_SUBAGENT])
+# Skills are loaded by FilesystemBackend at runtime; do NOT bundle them into system_prompt here.
+KB_SUBAGENT: dict = {
+    "name": "knowledge-base",
+    "description": (
+        "Use to search and retrieve knowledge about private-domain operations: "
+        "store management SOPs, product knowledge, brand marketing policies, "
+        "customer retention tactics, and operational best practices. "
+        "Returns detailed answers with citations from the knowledge base."
+    ),
+    "tools": KB_TOOLS,
+    "system_prompt": BASE_KB_AGENT_SYSTEM_PROMPT,
+    "skills": ["/skills/knowledge-base", "/skills/private-domain-ops"],
+}
+
+
 class KBAgent:
     """知识库子智能体"""
 

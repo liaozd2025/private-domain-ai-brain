@@ -1,3 +1,8 @@
+---
+name: private-domain-ops
+description: Use when the task needs domain knowledge about private-domain operations, including 核心指标、社群运营、企微运营、私域增长公式 and common growth or retention playbooks.
+---
+
 # 私域运营领域知识 (SKILL.md)
 
 ## 核心概念词汇表

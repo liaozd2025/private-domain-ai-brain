@@ -19,24 +19,26 @@ from src.config import settings
 logger = structlog.get_logger(__name__)
 
 
-# ===== Embedding 模型（懒加载）=====
+# ===== Embedding（硅基流动 API）=====
 
 @lru_cache(maxsize=1)
-def get_embedding_model():
-    """懒加载 BGE 嵌入模型"""
-    from sentence_transformers import SentenceTransformer
-    logger.info("加载 Embedding 模型", model=settings.embedding_model)
-    model = SentenceTransformer(
-        settings.embedding_model,
-        device=settings.embedding_device,
+def get_embedding_client():
+    """懒加载硅基流动 Embedding 客户端"""
+    from openai import OpenAI
+    logger.info("初始化硅基流动 Embedding 客户端", model=settings.embedding_model)
+    return OpenAI(
+        api_key=settings.siliconflow_api_key,
+        base_url=settings.siliconflow_base_url,
     )
-    return model
 
 
 @lru_cache(maxsize=1)
 def get_reranker_model():
     """懒加载 BGE 重排序模型"""
+    import os
     from FlagEmbedding import FlagReranker
+    if settings.hf_token:
+        os.environ["HF_TOKEN"] = settings.hf_token
     logger.info("加载 Reranker 模型", model=settings.reranker_model)
     return FlagReranker(
         settings.reranker_model,
@@ -84,15 +86,14 @@ class SearchResults(BaseModel):
 # ===== 核心工具函数 =====
 
 def embed_query(query: str) -> list[float]:
-    """将查询文本转换为向量"""
-    model = get_embedding_model()
-    # BGE 中文模型需要特定指令前缀提升检索效果
-    instruction = "为这个句子生成表示以用于检索相关文章："
-    embedding = model.encode(
-        instruction + query,
-        normalize_embeddings=True,
+    """将查询文本转换为向量（硅基流动 API）"""
+    client = get_embedding_client()
+    response = client.embeddings.create(
+        model=settings.embedding_model,
+        input=query,
+        encoding_format="float",
     )
-    return embedding.tolist()
+    return response.data[0].embedding
 
 
 def search_milvus_raw(

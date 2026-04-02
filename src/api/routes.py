@@ -8,9 +8,11 @@
   GET /health - 健康检查
 """
 
+import mimetypes
 import uuid
 from pathlib import Path
 
+import anyio
 import structlog
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile
 
@@ -38,10 +40,17 @@ from src.config import settings
 from src.memory.attachments import (
     AttachmentAccessError,
     AttachmentNotFoundError,
+    AttachmentStorageError,
     resolve_attachment_refs_from_db,
-    save_attachment_metadata,
 )
 from src.memory.db import ensure_managed_schema, get_async_engine, uploaded_files_table
+from src.storage.oss import (
+    OSSStorageError,
+    build_object_key,
+)
+from src.storage.oss import (
+    upload_bytes as oss_upload_bytes,
+)
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -279,6 +288,9 @@ async def chat(
         raise HTTPException(status_code=403, detail=str(e))
     except AttachmentNotFoundError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except AttachmentStorageError as e:
+        logger.error("聊天附件从 OSS 获取失败", error=str(e), thread_id=thread_id)
+        raise HTTPException(status_code=503, detail="文件存储服务暂时不可用，请稍后重试")
     except Exception as e:
         logger.error("聊天请求失败", error=str(e), thread_id=thread_id)
         raise HTTPException(status_code=500, detail="请求处理失败，请稍后重试")
@@ -326,25 +338,15 @@ async def upload_file(
             detail=f"文件过大，最大支持 {settings.max_upload_size_mb}MB",
         )
 
-    # 保存文件
+    # 上传到 OSS
     file_id = uuid.uuid4().hex
-    upload_path = Path(settings.upload_dir) / user_id
-    upload_path.mkdir(parents=True, exist_ok=True)
-
-    safe_filename = f"{file_id}{suffix}"
-    file_path = upload_path / safe_filename
-
-    with open(file_path, "wb") as f:
-        f.write(content)
-
-    save_attachment_metadata(
-        file_id=file_id,
-        user_id=user_id,
-        filename=file.filename,
-        file_type=allowed_types[suffix],
-        file_path=str(file_path),
-        thread_id=thread_id,
-    )
+    object_key = build_object_key(user_id, file_id, suffix)
+    content_type = mimetypes.guess_type(file.filename or "")[0] or "application/octet-stream"
+    try:
+        await anyio.to_thread.run_sync(lambda: oss_upload_bytes(object_key, content, content_type))
+    except OSSStorageError as e:
+        logger.error("OSS 文件上传失败", user_id=user_id, filename=file.filename, error=str(e))
+        raise HTTPException(status_code=503, detail="文件存储服务暂时不可用，请稍后重试") from e
 
     await ensure_managed_schema()
     async with get_async_engine().begin() as conn:
@@ -354,7 +356,7 @@ async def upload_file(
                 thread_id=thread_id,
                 user_id=user_id,
                 filename=file.filename,
-                file_path=str(file_path),
+                file_path=object_key,
                 file_type=allowed_types[suffix],
                 file_size_bytes=len(content),
             )
@@ -366,6 +368,7 @@ async def upload_file(
         filename=file.filename,
         size_bytes=len(content),
         user_id=user_id,
+        oss_key=object_key,
     )
 
     return FileUploadResponse(

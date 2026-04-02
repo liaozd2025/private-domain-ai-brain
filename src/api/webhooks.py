@@ -9,9 +9,11 @@ OpenClaw Webhook 流程：
 """
 
 import hashlib
+import hmac
+import importlib
 import time
+from functools import cache
 
-import defusedxml.ElementTree as ET
 import httpx
 import structlog
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
@@ -24,6 +26,17 @@ router = APIRouter()
 # ===== 共享 HTTP 客户端 =====
 
 _http_client: httpx.AsyncClient | None = None
+
+
+@cache
+def _get_xml_parser():
+    """优先加载 defusedxml，缺失时回退到标准库解析器。"""
+    try:
+        return importlib.import_module("defusedxml.ElementTree")
+    except ModuleNotFoundError:
+        logger.warning("defusedxml 未安装，回退到标准库 XML 解析器")
+        return importlib.import_module("xml.etree.ElementTree")
+
 
 def _get_http_client() -> httpx.AsyncClient:
     global _http_client
@@ -99,6 +112,20 @@ def verify_wecom_signature(
     return computed == msg_signature
 
 
+def verify_openclaw_signature(body: bytes, signature: str) -> bool:
+    """验证 OpenClaw webhook 签名。"""
+    secret = settings.openclaw_webhook_secret
+    if not secret or not signature:
+        return False
+
+    expected = "sha256=" + hmac.new(
+        secret.encode("utf-8"),
+        body,
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+
 @router.get("/wecom")
 async def wecom_verify(
     msg_signature: str = Query(...),
@@ -133,7 +160,7 @@ async def wecom_receive(
     body = await request.body()
 
     try:
-        root = ET.fromstring(body.decode("utf-8"))
+        root = _get_xml_parser().fromstring(body.decode("utf-8"))
     except Exception as e:
         logger.error("解析企微消息 XML 失败", error=str(e))
         raise HTTPException(status_code=400, detail="无效的消息格式")
@@ -170,7 +197,6 @@ async def handle_wecom_message(from_user: str, content: str, agent_id: str):
     """处理企微消息（后台任务）"""
     try:
         from src.agent.customer_service import get_customer_service_supervisor
-        from src.memory.conversations import record_conversation_turn
 
         thread_id = f"wecom_{from_user}"
         customer_service_supervisor = await get_customer_service_supervisor()
@@ -178,13 +204,6 @@ async def handle_wecom_message(from_user: str, content: str, agent_id: str):
             message=content,
             thread_id=thread_id,
             user_id=from_user,
-            channel="wecom",
-        )
-        await record_conversation_turn(
-            thread_id=thread_id,
-            user_id=from_user,
-            user_role="customer",
-            message=content,
             channel="wecom",
         )
 
@@ -226,6 +245,14 @@ async def openclaw_receive(
     background_tasks: BackgroundTasks,
 ):
     """接收 OpenClaw 事件"""
+    if not settings.openclaw_webhook_secret:
+        raise HTTPException(status_code=503, detail="OpenClaw webhook 未配置")
+
+    body = await request.body()
+    signature = request.headers.get("X-OpenClaw-Signature", "")
+    if not verify_openclaw_signature(body, signature):
+        raise HTTPException(status_code=403, detail="签名验证失败")
+
     try:
         payload = await request.json()
         event_type = payload.get("event_type", "")
@@ -281,13 +308,14 @@ async def handle_openclaw_message(
                 user_role=user_role,
                 channel=channel,
             )
-        await record_conversation_turn(
-            thread_id=thread_id,
-            user_id=user_id,
-            user_role=user_role,
-            message=message,
-            channel=channel,
-        )
+            await record_conversation_turn(
+                thread_id=thread_id,
+                user_id=user_id,
+                user_role=user_role,
+                message=message,
+                assistant_message=response,
+                channel=channel,
+            )
 
         # 通过 OpenClaw API 回复
         await send_openclaw_message(

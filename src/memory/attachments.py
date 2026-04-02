@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
+import anyio
+import structlog
+
 from src.config import settings
+
+logger = structlog.get_logger(__name__)
 
 
 class AttachmentError(Exception):
@@ -21,81 +25,43 @@ class AttachmentAccessError(AttachmentError):
     """附件访问越权"""
 
 
-def _metadata_dir() -> Path:
-    metadata_dir = Path(settings.upload_dir) / "_meta"
-    metadata_dir.mkdir(parents=True, exist_ok=True)
-    return metadata_dir
+class AttachmentStorageError(AttachmentError):
+    """附件存储不可用"""
 
 
-def save_attachment_metadata(
+def materialize_attachment_from_oss(
     *,
+    object_key: str,
     file_id: str,
     user_id: str,
-    filename: str,
-    file_type: str,
-    file_path: str,
-    thread_id: str | None = None,
-) -> dict[str, Any]:
-    """保存附件元数据"""
-    metadata = {
-        "file_id": file_id,
-        "user_id": user_id,
-        "filename": filename,
-        "file_type": file_type,
-        "file_path": file_path,
-        "thread_id": thread_id,
-    }
-    metadata_path = _metadata_dir() / f"{file_id}.json"
-    metadata_path.write_text(
-        json.dumps(metadata, ensure_ascii=False, indent=2),
-        encoding="utf-8",
+    suffix: str,
+) -> str:
+    """把 OSS 对象物化到 upload_dir 下的受控缓存路径。"""
+    from src.storage.oss import download_to_path
+
+    safe_user_id = user_id.strip() or "anonymous"
+    safe_suffix = suffix or Path(object_key).suffix
+    cache_path = (
+        Path(settings.upload_dir).resolve()
+        / "oss_cache"
+        / safe_user_id
+        / f"{file_id}{safe_suffix}"
     )
-    return metadata
-
-
-def get_attachment_metadata(file_id: str) -> dict[str, Any]:
-    """读取单个附件元数据"""
-    import re
-    if not re.fullmatch(r"[a-f0-9]{32}", file_id):
-        raise AttachmentNotFoundError(f"无效的附件 ID: {file_id}")
-    metadata_path = _metadata_dir() / f"{file_id}.json"
-    if not metadata_path.exists():
-        raise AttachmentNotFoundError(f"附件不存在: {file_id}")
-
-    return json.loads(metadata_path.read_text(encoding="utf-8"))
-
-
-def resolve_attachment_ref(ref: dict[str, Any], user_id: str) -> dict[str, Any]:
-    """根据 file_id 解析服务端附件信息"""
-    file_id = ref.get("file_id", "").strip()
-    if not file_id:
-        raise AttachmentNotFoundError("附件缺少 file_id")
-
-    metadata = get_attachment_metadata(file_id)
-    metadata_user_id = metadata.get("user_id", "")
-    if metadata_user_id and metadata_user_id != user_id:
-        raise AttachmentAccessError(f"无权访问附件: {file_id}")
-
-    file_path = metadata.get("file_path", "")
-    if not file_path or not Path(file_path).exists():
-        raise AttachmentNotFoundError(f"附件文件不存在或已被删除: {file_id}")
-
-    return metadata
-
-
-def resolve_attachment_refs(refs: list[dict[str, Any]], user_id: str) -> list[dict[str, Any]]:
-    """批量解析附件引用"""
-    return [resolve_attachment_ref(ref, user_id) for ref in refs]
+    return download_to_path(object_key, cache_path)
 
 
 async def resolve_attachment_refs_from_db(
     refs: list[dict[str, Any]],
     user_id: str,
 ) -> list[dict[str, Any]]:
-    """从 uploaded_files 表解析附件引用，找不到时 fallback 到文件系统 JSON。"""
+    """从 uploaded_files 表解析附件引用，从 OSS 下载到受控缓存目录后返回本地路径。"""
+    if not refs:
+        return []
+
     from sqlalchemy import select
 
     from src.memory.db import get_async_engine, uploaded_files_table
+    from src.storage.oss import OSSStorageError
 
     results = []
     async with get_async_engine().connect() as conn:
@@ -103,6 +69,8 @@ async def resolve_attachment_refs_from_db(
             file_id = ref.get("file_id", "").strip()
             if not file_id:
                 raise AttachmentNotFoundError("附件缺少 file_id")
+
+            logger.debug("解析附件引用", file_id=file_id, request_user_id=repr(user_id))
 
             row = (
                 await conn.execute(
@@ -113,18 +81,41 @@ async def resolve_attachment_refs_from_db(
             ).mappings().first()
 
             if row is None:
-                # fallback：兼容 DB 写入前的历史上传
-                metadata = get_attachment_metadata(file_id)
-                if metadata.get("user_id") and metadata["user_id"] != user_id:
-                    raise AttachmentAccessError(f"无权访问附件: {file_id}")
-            else:
-                metadata = dict(row)
-                if metadata.get("user_id") and metadata["user_id"] != user_id:
-                    raise AttachmentAccessError(f"无权访问附件: {file_id}")
+                raise AttachmentNotFoundError(f"附件不存在: {file_id}")
 
-            file_path = metadata.get("file_path", "")
-            if not file_path or not Path(file_path).exists():
-                raise AttachmentNotFoundError(f"附件文件不存在或已被删除: {file_id}")
+            metadata = dict(row)
+            stored_uid = metadata.get("user_id")
+            logger.debug(
+                "附件所有权校验",
+                file_id=file_id,
+                stored_user_id=repr(stored_uid),
+                request_user_id=repr(user_id),
+                match=(stored_uid == user_id),
+            )
+            if stored_uid and stored_uid != user_id:
+                raise AttachmentAccessError(f"无权访问附件: {file_id}")
 
+            object_key = metadata.get("file_path", "")
+            if not object_key:
+                raise AttachmentNotFoundError(f"附件 OSS key 为空: {file_id}")
+
+            try:
+                local_path = await anyio.to_thread.run_sync(
+                    lambda key=object_key, attachment_file_id=file_id, request_user_id=user_id: (
+                        materialize_attachment_from_oss(
+                            object_key=key,
+                            file_id=attachment_file_id,
+                            user_id=request_user_id,
+                            suffix=Path(key).suffix,
+                        )
+                    )
+                )
+            except OSSStorageError as e:
+                raise AttachmentStorageError(
+                    f"附件存储服务暂时不可用: {file_id}"
+                ) from e
+
+            metadata["file_path"] = local_path
             results.append(metadata)
+
     return results

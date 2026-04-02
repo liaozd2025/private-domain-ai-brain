@@ -5,8 +5,15 @@ from __future__ import annotations
 from datetime import datetime
 
 import structlog
+from sqlalchemy import func, select, update
 
-from src.config import settings
+from src.memory.db import (
+    conversation_metadata_table,
+    customer_service_messages_table,
+    ensure_managed_schema,
+    get_async_engine,
+    human_handoffs_table,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -55,12 +62,38 @@ def _row_to_message(row: dict | None) -> dict | None:
     }
 
 
+def _sender_type_to_unified_role(sender_type: str) -> str | None:
+    mapping = {
+        "customer": "user",
+        "ai": "assistant",
+        "human": "human",
+        "system": "system",
+    }
+    return mapping.get(sender_type)
+
+
+def _handoff_returning():
+    return (
+        human_handoffs_table.c.id,
+        human_handoffs_table.c.thread_id,
+        human_handoffs_table.c.user_id,
+        human_handoffs_table.c.channel,
+        human_handoffs_table.c.status,
+        human_handoffs_table.c.reason,
+        human_handoffs_table.c.last_customer_message,
+        human_handoffs_table.c.claimed_by,
+        human_handoffs_table.c.claimed_at,
+        human_handoffs_table.c.resolved_at,
+        human_handoffs_table.c.created_at,
+        human_handoffs_table.c.updated_at,
+    )
+
+
 class CustomerServiceStore:
     """客服消息与人工接管存储。"""
 
     def __init__(self):
-        self._pool = None
-        self._schema_ready = False
+        self._engine = None
         self._disabled_reason: str | None = None
         self._logged_disabled_reason = False
 
@@ -70,124 +103,67 @@ class CustomerServiceStore:
             logger.warning("客服存储已降级", reason=reason, error=error)
             self._logged_disabled_reason = True
 
-    async def _get_pool(self):
+    def _get_engine(self):
         if self._disabled_reason:
             return None
-
-        if self._pool is None:
+        if self._engine is None:
             try:
-                import asyncpg
-            except ModuleNotFoundError as e:
-                self._disable("asyncpg_unavailable", error=str(e))
+                self._engine = get_async_engine()
+            except Exception as exc:
+                self._disable("engine_init_failed", error=str(exc))
                 return None
+        return self._engine
 
-            try:
-                self._pool = await asyncpg.create_pool(
-                    host=settings.postgres_host,
-                    port=settings.postgres_port,
-                    database=settings.postgres_db,
-                    user=settings.postgres_user,
-                    password=settings.postgres_password,
-                    max_size=10,
-                )
-            except Exception as e:
-                self._disable("pool_init_failed", error=str(e))
-                return None
+    async def _ensure_schema(self) -> bool:
+        engine = self._get_engine()
+        if engine is None:
+            return False
+        try:
+            await ensure_managed_schema()
+        except Exception as exc:
+            self._disable("schema_init_failed", error=str(exc))
+            return False
+        return True
 
-        if not self._schema_ready:
-            await self._ensure_schema()
-        return self._pool
-
-    async def _ensure_schema(self) -> None:
-        pool = self._pool
-        if pool is None or self._schema_ready:
-            return
-
-        async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS customer_service_messages (
-                    id BIGSERIAL PRIMARY KEY,
-                    thread_id VARCHAR(255) NOT NULL,
-                    user_id VARCHAR(255) NOT NULL,
-                    channel VARCHAR(50) NOT NULL DEFAULT 'web',
-                    sender_type VARCHAR(20) NOT NULL,
-                    content TEXT NOT NULL,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                )
-                """
-            )
-            await conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_customer_service_messages_thread
-                ON customer_service_messages(thread_id, created_at ASC)
-                """
-            )
-            await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS human_handoffs (
-                    id VARCHAR(255) PRIMARY KEY,
-                    thread_id VARCHAR(255) NOT NULL,
-                    user_id VARCHAR(255) NOT NULL,
-                    channel VARCHAR(50) NOT NULL DEFAULT 'web',
-                    status VARCHAR(20) NOT NULL,
-                    reason TEXT,
-                    last_customer_message TEXT,
-                    claimed_by VARCHAR(255),
-                    claimed_at TIMESTAMPTZ,
-                    resolved_at TIMESTAMPTZ,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                )
-                """
-            )
-            await conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_human_handoffs_status
-                ON human_handoffs(status, updated_at DESC)
-                """
-            )
-            await conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_human_handoffs_thread
-                ON human_handoffs(thread_id, updated_at DESC)
-                """
-            )
-            await conn.execute(
-                """
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_human_handoffs_active_thread
-                ON human_handoffs(thread_id)
-                WHERE status IN ('pending', 'claimed')
-                """
-            )
-            await conn.execute(
-                """
-                ALTER TABLE conversation_metadata
-                ADD COLUMN IF NOT EXISTS user_role VARCHAR(50) DEFAULT 'unknown'
-                """
-            )
-        self._schema_ready = True
-
-    async def _fetchrow(self, query: str, *args):
-        pool = await self._get_pool()
-        if pool is None:
+    async def _fetchrow(self, stmt):
+        if not await self._ensure_schema():
             return None
-        async with pool.acquire() as conn:
-            return await conn.fetchrow(query, *args)
+        engine = self._get_engine()
+        if engine is None:
+            return None
+        async with engine.connect() as conn:
+            row = (await conn.execute(stmt)).mappings().first()
+        return dict(row) if row else None
 
-    async def _fetch(self, query: str, *args):
-        pool = await self._get_pool()
-        if pool is None:
+    async def _write_fetchrow(self, stmt):
+        if not await self._ensure_schema():
+            return None
+        engine = self._get_engine()
+        if engine is None:
+            return None
+        async with engine.begin() as conn:
+            row = (await conn.execute(stmt)).mappings().first()
+        return dict(row) if row else None
+
+    async def _fetch(self, stmt):
+        if not await self._ensure_schema():
             return []
-        async with pool.acquire() as conn:
-            return await conn.fetch(query, *args)
+        engine = self._get_engine()
+        if engine is None:
+            return []
+        async with engine.connect() as conn:
+            rows = (await conn.execute(stmt)).mappings().all()
+        return [dict(row) for row in rows]
 
-    async def _execute(self, query: str, *args):
-        pool = await self._get_pool()
-        if pool is None:
-            return ""
-        async with pool.acquire() as conn:
-            return await conn.execute(query, *args)
+    async def _execute(self, stmt):
+        if not await self._ensure_schema():
+            return 0
+        engine = self._get_engine()
+        if engine is None:
+            return 0
+        async with engine.begin() as conn:
+            result = await conn.execute(stmt)
+        return result.rowcount or 0
 
     async def append_message(
         self,
@@ -198,20 +174,38 @@ class CustomerServiceStore:
         sender_type: str,
         content: str,
     ) -> dict | None:
-        row = await self._fetchrow(
-            """
-            INSERT INTO customer_service_messages (
-                thread_id, user_id, channel, sender_type, content
+        row = await self._write_fetchrow(
+            customer_service_messages_table.insert()
+            .values(
+                thread_id=thread_id,
+                user_id=user_id,
+                channel=channel,
+                sender_type=sender_type,
+                content=content,
             )
-            VALUES ($1, $2, $3, $4, $5)
-            RETURNING id, thread_id, user_id, channel, sender_type, content, created_at
-            """,
-            thread_id,
-            user_id,
-            channel,
-            sender_type,
-            content,
+            .returning(
+                customer_service_messages_table.c.id,
+                customer_service_messages_table.c.thread_id,
+                customer_service_messages_table.c.user_id,
+                customer_service_messages_table.c.channel,
+                customer_service_messages_table.c.sender_type,
+                customer_service_messages_table.c.content,
+                customer_service_messages_table.c.created_at,
+            )
         )
+        unified_role = _sender_type_to_unified_role(sender_type)
+        if unified_role:
+            from src.memory.conversations import get_conversation_store
+
+            conversation_store = get_conversation_store()
+            await conversation_store.record_messages(
+                thread_id=thread_id,
+                user_id=user_id,
+                user_role="customer",
+                channel=channel,
+                store_id=None,
+                messages=[{"role": unified_role, "content": content}],
+            )
         return _row_to_message(row)
 
     async def get_thread_messages(
@@ -221,76 +215,55 @@ class CustomerServiceStore:
         user_id: str | None = None,
         limit: int = 50,
     ) -> list[dict]:
-        conditions = ["thread_id = $1"]
-        args: list = [thread_id]
-        arg_index = 2
+        conditions = [customer_service_messages_table.c.thread_id == thread_id]
         if user_id is not None:
-            conditions.append(f"user_id = ${arg_index}")
-            args.append(user_id)
-            arg_index += 1
-        args.append(limit)
+            conditions.append(customer_service_messages_table.c.user_id == user_id)
         rows = await self._fetch(
-            f"""
-            SELECT id, thread_id, user_id, channel, sender_type, content, created_at
-            FROM customer_service_messages
-            WHERE {' AND '.join(conditions)}
-            ORDER BY created_at ASC
-            LIMIT ${arg_index}
-            """,
-            *args,
+            select(
+                customer_service_messages_table.c.id,
+                customer_service_messages_table.c.thread_id,
+                customer_service_messages_table.c.user_id,
+                customer_service_messages_table.c.channel,
+                customer_service_messages_table.c.sender_type,
+                customer_service_messages_table.c.content,
+                customer_service_messages_table.c.created_at,
+            )
+            .where(*conditions)
+            .order_by(customer_service_messages_table.c.created_at.asc())
+            .limit(limit)
         )
-        return [_row_to_message(dict(row)) for row in rows]
+        return [_row_to_message(row) for row in rows]
 
     async def is_customer_thread(self, thread_id: str, *, user_id: str | None = None) -> bool:
-        conditions = ["thread_id = $1"]
-        args: list = [thread_id]
-        arg_index = 2
+        conditions = [customer_service_messages_table.c.thread_id == thread_id]
         if user_id is not None:
-            conditions.append(f"user_id = ${arg_index}")
-            args.append(user_id)
-            arg_index += 1
+            conditions.append(customer_service_messages_table.c.user_id == user_id)
         message_row = await self._fetchrow(
-            f"""
-            SELECT 1 AS exists_flag
-            FROM customer_service_messages
-            WHERE {' AND '.join(conditions)}
-            LIMIT 1
-            """,
-            *args,
+            select(customer_service_messages_table.c.id).where(*conditions).limit(1)
         )
         if message_row:
             return True
 
-        # Use a fresh index for the second query
-        metadata_conditions = ["thread_id = $1", "user_role = 'customer'"]
-        metadata_args: list = [thread_id]
-        metadata_arg_index = 2
+        metadata_conditions = [
+            conversation_metadata_table.c.thread_id == thread_id,
+            conversation_metadata_table.c.user_role == "customer",
+        ]
         if user_id is not None:
-            metadata_conditions.append(f"user_id = ${metadata_arg_index}")
-            metadata_args.append(user_id)
+            metadata_conditions.append(conversation_metadata_table.c.user_id == user_id)
         metadata_row = await self._fetchrow(
-            f"""
-            SELECT 1 AS exists_flag
-            FROM conversation_metadata
-            WHERE {' AND '.join(metadata_conditions)}
-            LIMIT 1
-            """,
-            *metadata_args,
+            select(conversation_metadata_table.c.thread_id).where(*metadata_conditions).limit(1)
         )
         return bool(metadata_row)
 
     async def get_active_handoff(self, thread_id: str) -> dict | None:
         row = await self._fetchrow(
-            """
-            SELECT id, thread_id, user_id, channel, status, reason,
-                   last_customer_message, claimed_by, claimed_at, resolved_at,
-                   created_at, updated_at
-            FROM human_handoffs
-            WHERE thread_id = $1 AND status IN ('pending', 'claimed')
-            ORDER BY updated_at DESC
-            LIMIT 1
-            """,
-            thread_id,
+            select(*_handoff_returning())
+            .where(
+                human_handoffs_table.c.thread_id == thread_id,
+                human_handoffs_table.c.status.in_(("pending", "claimed")),
+            )
+            .order_by(human_handoffs_table.c.updated_at.desc())
+            .limit(1)
         )
         return _row_to_handoff(row)
 
@@ -305,41 +278,30 @@ class CustomerServiceStore:
     ) -> dict | None:
         active = await self.get_active_handoff(thread_id)
         if active:
-            row = await self._fetchrow(
-                """
-                UPDATE human_handoffs
-                SET reason = $2,
-                    last_customer_message = $3,
-                    updated_at = NOW()
-                WHERE id = $1
-                RETURNING id, thread_id, user_id, channel, status, reason,
-                          last_customer_message, claimed_by, claimed_at, resolved_at,
-                          created_at, updated_at
-                """,
-                active["id"],
-                reason,
-                last_customer_message,
+            row = await self._write_fetchrow(
+                update(human_handoffs_table)
+                .where(human_handoffs_table.c.id == active["id"])
+                .values(
+                    reason=reason,
+                    last_customer_message=last_customer_message,
+                    updated_at=func.now(),
+                )
+                .returning(*_handoff_returning())
             )
             return _row_to_handoff(row)
 
-        row = await self._fetchrow(
-            """
-            INSERT INTO human_handoffs (
-                id, thread_id, user_id, channel, status, reason, last_customer_message
+        row = await self._write_fetchrow(
+            human_handoffs_table.insert()
+            .values(
+                id=f"handoff_{thread_id}",
+                thread_id=thread_id,
+                user_id=user_id,
+                channel=channel,
+                status="pending",
+                reason=reason,
+                last_customer_message=last_customer_message,
             )
-            VALUES (
-                $1, $2, $3, $4, 'pending', $5, $6
-            )
-            RETURNING id, thread_id, user_id, channel, status, reason,
-                      last_customer_message, claimed_by, claimed_at, resolved_at,
-                      created_at, updated_at
-            """,
-            f"handoff_{thread_id}",
-            thread_id,
-            user_id,
-            channel,
-            reason,
-            last_customer_message,
+            .returning(*_handoff_returning())
         )
         return _row_to_handoff(row)
 
@@ -351,51 +313,29 @@ class CustomerServiceStore:
         limit: int = 20,
         offset: int = 0,
     ) -> dict:
-        conditions = ["1 = 1"]
-        args: list = []
+        conditions = []
         if status:
-            args.append(status)
-            conditions.append(f"status = ${len(args)}")
+            conditions.append(human_handoffs_table.c.status == status)
         if channel:
-            args.append(channel)
-            conditions.append(f"channel = ${len(args)}")
-
-        args_with_page = [*args, limit, offset]
+            conditions.append(human_handoffs_table.c.channel == channel)
         rows = await self._fetch(
-            f"""
-            SELECT id, thread_id, user_id, channel, status, reason,
-                   last_customer_message, claimed_by, claimed_at, resolved_at,
-                   created_at, updated_at
-            FROM human_handoffs
-            WHERE {' AND '.join(conditions)}
-            ORDER BY updated_at DESC
-            LIMIT ${len(args) + 1} OFFSET ${len(args) + 2}
-            """,
-            *args_with_page,
+            select(*_handoff_returning())
+            .where(*conditions)
+            .order_by(human_handoffs_table.c.updated_at.desc())
+            .limit(limit)
+            .offset(offset)
         )
         count_row = await self._fetchrow(
-            f"""
-            SELECT COUNT(*) AS total
-            FROM human_handoffs
-            WHERE {' AND '.join(conditions)}
-            """,
-            *args,
+            select(func.count().label("total")).select_from(human_handoffs_table).where(*conditions)
         )
         return {
-            "items": [_row_to_handoff(dict(row)) for row in rows],
+            "items": [_row_to_handoff(row) for row in rows],
             "total": int(count_row["total"]) if count_row else 0,
         }
 
     async def get_handoff_detail(self, handoff_id: str) -> dict | None:
         row = await self._fetchrow(
-            """
-            SELECT id, thread_id, user_id, channel, status, reason,
-                   last_customer_message, claimed_by, claimed_at, resolved_at,
-                   created_at, updated_at
-            FROM human_handoffs
-            WHERE id = $1
-            """,
-            handoff_id,
+            select(*_handoff_returning()).where(human_handoffs_table.c.id == handoff_id)
         )
         handoff = _row_to_handoff(row)
         if not handoff:
@@ -408,20 +348,19 @@ class CustomerServiceStore:
         return handoff
 
     async def claim_handoff(self, *, handoff_id: str, agent_id: str) -> dict | None:
-        row = await self._fetchrow(
-            """
-            UPDATE human_handoffs
-            SET status = 'claimed',
-                claimed_by = $2,
-                claimed_at = COALESCE(claimed_at, NOW()),
-                updated_at = NOW()
-            WHERE id = $1 AND status IN ('pending', 'claimed')
-            RETURNING id, thread_id, user_id, channel, status, reason,
-                      last_customer_message, claimed_by, claimed_at, resolved_at,
-                      created_at, updated_at
-            """,
-            handoff_id,
-            agent_id,
+        row = await self._write_fetchrow(
+            update(human_handoffs_table)
+            .where(
+                human_handoffs_table.c.id == handoff_id,
+                human_handoffs_table.c.status.in_(("pending", "claimed")),
+            )
+            .values(
+                status="claimed",
+                claimed_by=agent_id,
+                claimed_at=func.coalesce(human_handoffs_table.c.claimed_at, func.now()),
+                updated_at=func.now(),
+            )
+            .returning(*_handoff_returning())
         )
         return _row_to_handoff(row)
 
@@ -452,16 +391,11 @@ class CustomerServiceStore:
                 resolution_note="人工回复后结束接管",
             )
 
-        row = await self._fetchrow(
-            """
-            UPDATE human_handoffs
-            SET updated_at = NOW()
-            WHERE id = $1
-            RETURNING id, thread_id, user_id, channel, status, reason,
-                      last_customer_message, claimed_by, claimed_at, resolved_at,
-                      created_at, updated_at
-            """,
-            handoff_id,
+        row = await self._write_fetchrow(
+            update(human_handoffs_table)
+            .where(human_handoffs_table.c.id == handoff_id)
+            .values(updated_at=func.now())
+            .returning(*_handoff_returning())
         )
         return _row_to_handoff(row)
 
@@ -472,21 +406,20 @@ class CustomerServiceStore:
         agent_id: str,
         resolution_note: str,
     ) -> dict | None:
-        row = await self._fetchrow(
-            """
-            UPDATE human_handoffs
-            SET status = 'resolved',
-                claimed_by = COALESCE(claimed_by, $2),
-                claimed_at = COALESCE(claimed_at, NOW()),
-                resolved_at = NOW(),
-                updated_at = NOW()
-            WHERE id = $1 AND status IN ('pending', 'claimed')
-            RETURNING id, thread_id, user_id, channel, status, reason,
-                      last_customer_message, claimed_by, claimed_at, resolved_at,
-                      created_at, updated_at
-            """,
-            handoff_id,
-            agent_id,
+        row = await self._write_fetchrow(
+            update(human_handoffs_table)
+            .where(
+                human_handoffs_table.c.id == handoff_id,
+                human_handoffs_table.c.status.in_(("pending", "claimed")),
+            )
+            .values(
+                status="resolved",
+                claimed_by=func.coalesce(human_handoffs_table.c.claimed_by, agent_id),
+                claimed_at=func.coalesce(human_handoffs_table.c.claimed_at, func.now()),
+                resolved_at=func.now(),
+                updated_at=func.now(),
+            )
+            .returning(*_handoff_returning())
         )
         handoff = _row_to_handoff(row)
         if handoff and resolution_note:
@@ -500,8 +433,7 @@ class CustomerServiceStore:
         return handoff
 
     async def close(self):
-        if self._pool:
-            await self._pool.close()
+        self._engine = None
 
 
 _customer_service_store: CustomerServiceStore | None = None

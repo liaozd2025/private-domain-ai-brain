@@ -90,6 +90,13 @@ ROUTER_SYSTEM_PROMPT = """你是一个查询意图分类器。将用户消息分
 
 TABULAR_FILE_TYPES = {"csv", "excel"}
 IMAGE_FILE_TYPES = {"image"}
+
+# 门店经营数据关键词（纯文本启发式短路，命中 ≥ 2 个 → data_analysis）
+STORE_DATA_KEYWORDS = (
+    "客流量", "成交率", "成交均价", "体验率",
+    "毛利率", "经营利润", "人头数", "营业额",
+)
+_STORE_DATA_MIN_HITS = 2
 ATTACHMENT_ANALYSIS_KEYWORDS = {
     "图片", "图", "截图", "海报", "照片", "文件", "文档",
     "总结", "摘要", "提取", "识别", "看看", "讲了什么",
@@ -126,6 +133,18 @@ class QueryRouter:
                 query_type=QueryType.CHITCHAT,
                 confidence=0.99,
                 reasoning="启发式匹配：明显闲聊词",
+            )
+        return None
+
+    def _classify_data_analysis_heuristic(self, query: str) -> RouterDecision | None:
+        """门店经营数据启发式短路 — 命中 2+ 关键词直接返回 data_analysis"""
+        text = query.lower()
+        hits = sum(1 for kw in STORE_DATA_KEYWORDS if kw in text)
+        if hits >= _STORE_DATA_MIN_HITS:
+            return RouterDecision(
+                query_type=QueryType.DATA_ANALYSIS,
+                confidence=0.95,
+                reasoning=f"启发式匹配：门店经营数据关键词命中{hits}个",
             )
         return None
 
@@ -185,12 +204,17 @@ class QueryRouter:
             if chitchat_decision:
                 return chitchat_decision
 
-        # 2. 附件确定性短路
+        # 2. 门店经营数据启发式短路（纯文本）
+        store_decision = self._classify_data_analysis_heuristic(query)
+        if store_decision:
+            return store_decision
+
+        # 3. 附件确定性短路
         attachment_decision = self._classify_with_attachments(query, attachments)
         if attachment_decision:
             return attachment_decision
 
-        # 3. LLM 分类（包含附件上下文信息）
+        # 4. LLM 分类（包含附件上下文信息）
         parts = []
         if context:
             parts.append(f"[对话上下文]: {context}")

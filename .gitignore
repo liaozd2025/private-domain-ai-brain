@@ -8,6 +8,8 @@ build/
 .venv/
 venv/
 .env
+.env.dev
+.env.prod
 
 # Uploads
 uploads/
