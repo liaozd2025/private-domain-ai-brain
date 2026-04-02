@@ -136,9 +136,13 @@ class AttachmentAnalysisAgent:
         return "\n\n".join(sections)
 
     def _file_to_data_url(self, file_path: str) -> str:
+        path = Path(file_path)
+        size = path.stat().st_size
+        if size > 20 * 1024 * 1024:
+            raise ValueError(f"图片文件过大（{size} bytes），上限 20MB")
         mime_type, _ = mimetypes.guess_type(file_path)
         mime_type = mime_type or "application/octet-stream"
-        encoded = base64.b64encode(Path(file_path).read_bytes()).decode("utf-8")
+        encoded = base64.b64encode(path.read_bytes()).decode("utf-8")
         return f"data:{mime_type};base64,{encoded}"
 
     def _extract_message_content(self, response) -> str:

@@ -1,5 +1,6 @@
 """数据分析智能体测试"""
 
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -63,6 +64,40 @@ result = f"总销售额: {total}"
     assert "总销售额" in result or "328000" in result
 
 
+def test_run_python_analysis_allows_whitelisted_imports(sample_csv, tmp_path):
+    """白名单 import 不应因缺少 __import__ 而失败。"""
+    from src.subagents.data_analysis import run_python_analysis
+
+    allowed_csv = tmp_path / "uploads" / "sales_data.csv"
+    allowed_csv.parent.mkdir(parents=True, exist_ok=True)
+    allowed_csv.write_text(Path(sample_csv).read_text(encoding="utf-8"), encoding="utf-8")
+
+    code = f"""
+import pandas as pd
+df2 = pd.read_csv(r"{allowed_csv}")
+result = f"行数: {{len(df2)}}"
+"""
+    with patch("src.subagents.data_analysis.settings.upload_dir", str(tmp_path / "uploads")):
+        result = run_python_analysis.invoke({"code": code})
+
+    assert "行数: 6" in result
+
+
+def test_run_python_analysis_imported_pandas_keeps_upload_dir_guard(sample_csv, tmp_path):
+    """即使通过 import pandas as pd，也不能绕过 upload_dir 路径限制。"""
+    from src.subagents.data_analysis import run_python_analysis
+
+    code = f"""
+import pandas as pd
+df2 = pd.read_csv(r"{sample_csv}")
+result = "should not happen"
+"""
+    with patch("src.subagents.data_analysis.settings.upload_dir", str(tmp_path / "uploads")):
+        result = run_python_analysis.invoke({"code": code})
+
+    assert "不允许读取路径" in result
+
+
 def test_run_python_analysis_blocks_dangerous_code():
     """危险代码应被拒绝"""
     from src.subagents.data_analysis import run_python_analysis
@@ -101,6 +136,16 @@ def test_build_store_diagnosis_prompt_contains_required_sections(sample_csv):
     assert "品牌化动作建议" in prompt
     assert "行动计划表" in prompt
     assert "体验率" in prompt
+
+
+def test_base_data_analysis_prompt_forbids_reimport_and_hardcoded_paths():
+    """基础提示词应明确要求复用预置变量和 file_path 参数。"""
+    from src.subagents.data_analysis import build_data_analysis_system_prompt
+
+    prompt = build_data_analysis_system_prompt(query="帮我分析附件指标", attachments=[])
+
+    assert "运行环境已预置 pd / np / plt" in prompt
+    assert "不要在代码里硬编码" in prompt
 
 
 @pytest.mark.asyncio
@@ -143,20 +188,32 @@ async def test_data_analysis_agent(sample_csv):
         return_value={"output": "分析报告：门店B销售额最高，达80000元。"}
     )
 
-    with patch("src.subagents.data_analysis.AgentExecutor", return_value=agent_mock):
-        with patch(
-            "src.subagents.data_analysis.create_tool_calling_agent",
-            return_value=MagicMock(),
-        ):
-            da = DataAnalysisAgent(llm=mock_llm)
-            da._agent = agent_mock
+    da = DataAnalysisAgent(llm=mock_llm)
+    da._agent = agent_mock
 
-            result = await da.analyze(
-                query="哪个门店销售额最高",
-                attachments=[{"filename": "sales_data.csv", "file_path": sample_csv}],
-            )
-            assert isinstance(result, str)
-            assert len(result) > 0
-            # 验证文件路径被注入请求
-            call_input = agent_mock.ainvoke.call_args[0][0]["input"]
-            assert sample_csv in call_input
+    result = await da.analyze(
+        query="哪个门店销售额最高",
+        attachments=[{"filename": "sales_data.csv", "file_path": sample_csv}],
+    )
+    assert isinstance(result, str)
+    assert len(result) > 0
+    # 验证文件路径被注入请求
+    call_input = agent_mock.ainvoke.call_args[0][0]["input"]
+    assert sample_csv in call_input
+
+
+def test_data_analysis_subagent_uses_skill_mount_and_runtime_bundle():
+    """数据分析 Deep Agent 应挂载 skill，门店诊断运行时 prompt 仍应包含 references。"""
+    from src.subagents.data_analysis import (
+        DATA_ANALYSIS_SUBAGENT,
+        build_data_analysis_system_prompt,
+    )
+
+    prompt = build_data_analysis_system_prompt(
+        query="请根据门店五大指标做经营诊断",
+        attachments=[{"filename": "门店五大指标.xlsx"}],
+    )
+
+    assert DATA_ANALYSIS_SUBAGENT["skills"] == ["/skills/data-analysis"]
+    assert "门店数据分析诊断" in prompt
+    assert "store-diagnosis-rules" in prompt.lower() or "默认阈值" in prompt

@@ -1,15 +1,28 @@
-"""会话元数据持久化。"""
+"""统一会话元数据与消息明细持久化。"""
 
 from __future__ import annotations
 
+import base64
+import inspect
+import json
 import re
 from datetime import datetime
 
 import structlog
+from sqlalchemy import and_, case, func, or_, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from src.config import settings
+from src.memory.db import (
+    conversation_messages_table,
+    conversation_metadata_table,
+    ensure_managed_schema,
+    get_async_engine,
+)
 
 logger = structlog.get_logger(__name__)
+
+UNIFIED_MESSAGE_SOURCE = "unified"
+LEGACY_MESSAGE_SOURCE = "legacy"
 
 
 def build_conversation_title(message: str, max_length: int = 30) -> str:
@@ -28,200 +41,539 @@ def _serialize_timestamp(value) -> str | None:
     return str(value)
 
 
+def _parse_cursor_timestamp(value: str) -> datetime:
+    return datetime.fromisoformat(value)
+
+
 def _row_to_summary(row: dict | None) -> dict | None:
     if not row:
         return None
     return {
         "thread_id": row["thread_id"],
         "user_id": row.get("user_id"),
+        "user_role": row.get("user_role") or "unknown",
         "title": row.get("title") or "新会话",
         "channel": row.get("channel") or "web",
         "created_at": _serialize_timestamp(row.get("created_at")),
         "last_message_at": _serialize_timestamp(row.get("last_message_at")),
         "message_count": row.get("message_count", 0),
+        "message_source": row.get("message_source") or LEGACY_MESSAGE_SOURCE,
         "is_deleted": bool(row.get("is_deleted", False)),
         "deleted_at": _serialize_timestamp(row.get("deleted_at")),
     }
 
 
+def _row_to_message(row: dict | None) -> dict | None:
+    if not row:
+        return None
+    return {
+        "id": str(row["id"]),
+        "role": row["role"],
+        "content": row["content"],
+        "created_at": _serialize_timestamp(row.get("created_at")),
+    }
+
+
+def _encode_cursor(payload: dict[str, str]) -> str:
+    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("utf-8").rstrip("=")
+
+
+def _decode_cursor(cursor: str | None) -> dict[str, str] | None:
+    if not cursor:
+        return None
+    padding = "=" * (-len(cursor) % 4)
+    try:
+        raw = base64.urlsafe_b64decode(f"{cursor}{padding}".encode()).decode("utf-8")
+        payload = json.loads(raw)
+    except Exception as exc:
+        raise ValueError("无效的游标") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("无效的游标")
+    return {str(key): str(value) for key, value in payload.items()}
+
+
+def _summary_cursor(item: dict | None) -> str | None:
+    if not item or not item.get("last_message_at"):
+        return None
+    return _encode_cursor(
+        {
+            "last_message_at": str(item["last_message_at"]),
+            "thread_id": str(item["thread_id"]),
+        }
+    )
+
+
+def _message_cursor(item: dict | None) -> str | None:
+    if not item or not item.get("created_at"):
+        return None
+    return _encode_cursor(
+        {
+            "created_at": str(item["created_at"]),
+            "id": str(item["id"]),
+        }
+    )
+
+
+def _returning_summary():
+    return (
+        conversation_metadata_table.c.thread_id,
+        conversation_metadata_table.c.user_id,
+        conversation_metadata_table.c.user_role,
+        conversation_metadata_table.c.title,
+        conversation_metadata_table.c.channel,
+        conversation_metadata_table.c.created_at,
+        conversation_metadata_table.c.last_message_at,
+        conversation_metadata_table.c.message_count,
+        conversation_metadata_table.c.message_source,
+        conversation_metadata_table.c.is_deleted,
+        conversation_metadata_table.c.deleted_at,
+    )
+
+
 class ConversationStore:
-    """会话元数据存储。"""
+    """统一会话存储。"""
 
     def __init__(self):
-        self._pool = None
-        self._schema_ready = False
+        self._engine = None
         self._disabled_reason: str | None = None
         self._logged_disabled_reason = False
 
     def _disable(self, reason: str, *, error: str = "") -> None:
         self._disabled_reason = reason
         if not self._logged_disabled_reason:
-            logger.warning("会话元数据存储已降级", reason=reason, error=error)
+            logger.warning("会话存储已降级", reason=reason, error=error)
             self._logged_disabled_reason = True
 
-    async def _get_pool(self):
+    def _get_engine(self):
         if self._disabled_reason:
             return None
-
-        if self._pool is None:
+        if self._engine is None:
             try:
-                import asyncpg
-            except ModuleNotFoundError as e:
-                self._disable("asyncpg_unavailable", error=str(e))
+                self._engine = get_async_engine()
+            except Exception as exc:
+                self._disable("engine_init_failed", error=str(exc))
                 return None
+        return self._engine
 
-            try:
-                self._pool = await asyncpg.create_pool(
-                    host=settings.postgres_host,
-                    port=settings.postgres_port,
-                    database=settings.postgres_db,
-                    user=settings.postgres_user,
-                    password=settings.postgres_password,
-                    max_size=10,
+    async def _ensure_schema(self) -> bool:
+        engine = self._get_engine()
+        if engine is None:
+            return False
+        try:
+            await ensure_managed_schema()
+        except Exception as exc:
+            self._disable("schema_init_failed", error=str(exc))
+            return False
+        return True
+
+    async def _fetchrow(self, stmt):
+        if not await self._ensure_schema():
+            return None
+        engine = self._get_engine()
+        if engine is None:
+            return None
+        async with engine.connect() as conn:
+            row = (await conn.execute(stmt)).mappings().first()
+        return dict(row) if row else None
+
+    async def _write_fetchrow(self, stmt):
+        if not await self._ensure_schema():
+            return None
+        engine = self._get_engine()
+        if engine is None:
+            return None
+        async with engine.begin() as conn:
+            row = (await conn.execute(stmt)).mappings().first()
+        return dict(row) if row else None
+
+    async def _fetch(self, stmt):
+        if not await self._ensure_schema():
+            return []
+        engine = self._get_engine()
+        if engine is None:
+            return []
+        async with engine.connect() as conn:
+            rows = (await conn.execute(stmt)).mappings().all()
+        return [dict(row) for row in rows]
+
+    async def _execute(self, stmt):
+        if not await self._ensure_schema():
+            return 0
+        engine = self._get_engine()
+        if engine is None:
+            return 0
+        async with engine.begin() as conn:
+            result = await conn.execute(stmt)
+        return result.rowcount or 0
+
+    async def record_messages(
+        self,
+        *,
+        thread_id: str,
+        user_id: str,
+        user_role: str = "unknown",
+        channel: str,
+        store_id: str | None = None,
+        messages: list[dict[str, str]],
+    ) -> dict:
+        normalized_messages = []
+        for item in messages:
+            role = str(item.get("role", "")).strip()
+            content = str(item.get("content", "")).strip()
+            if not role or not content:
+                continue
+            normalized_messages.append({"role": role, "content": content})
+        if not normalized_messages:
+            return {}
+
+        if not await self._ensure_schema():
+            return {}
+        engine = self._get_engine()
+        if engine is None:
+            return {}
+
+        title_source = next(
+            (item["content"] for item in normalized_messages if item["role"] == "user"),
+            normalized_messages[0]["content"],
+        )
+        insert_stmt = pg_insert(conversation_metadata_table).values(
+            thread_id=thread_id,
+            user_id=user_id,
+            user_role=user_role,
+            title=build_conversation_title(title_source),
+            channel=channel,
+            message_count=len(normalized_messages),
+            message_source=UNIFIED_MESSAGE_SOURCE,
+            is_deleted=False,
+            deleted_at=None,
+        )
+        meta_stmt = insert_stmt.on_conflict_do_update(
+            index_elements=[conversation_metadata_table.c.thread_id],
+            set_={
+                "user_id": insert_stmt.excluded.user_id,
+                "user_role": insert_stmt.excluded.user_role,
+                "channel": insert_stmt.excluded.channel,
+                "last_message_at": func.now(),
+                "message_count": (
+                    conversation_metadata_table.c.message_count
+                    + insert_stmt.excluded.message_count
+                ),
+                "message_source": UNIFIED_MESSAGE_SOURCE,
+                "is_deleted": False,
+                "deleted_at": None,
+                "title": case(
+                    (
+                        or_(
+                            conversation_metadata_table.c.title.is_(None),
+                            conversation_metadata_table.c.title == "",
+                        ),
+                        insert_stmt.excluded.title,
+                    ),
+                    else_=conversation_metadata_table.c.title,
+                ),
+            },
+        ).returning(*_returning_summary())
+
+        async with engine.begin() as conn:
+            for item in normalized_messages:
+                await conn.execute(
+                    conversation_messages_table.insert().values(
+                        thread_id=thread_id,
+                        user_id=user_id,
+                        channel=channel,
+                        store_id=store_id,
+                        role=item["role"],
+                        content=item["content"],
+                    )
                 )
-            except Exception as e:
-                self._disable("pool_init_failed", error=str(e))
-                return None
+            row = (await conn.execute(meta_stmt)).mappings().first()
 
-        if not self._schema_ready:
-            await self._ensure_schema()
-        return self._pool
+        return _row_to_summary(dict(row) if row else None) or {}
 
-    async def _ensure_schema(self) -> None:
-        pool = self._pool
-        if pool is None or self._schema_ready:
+    async def save_user_message(
+        self,
+        *,
+        thread_id: str,
+        user_id: str,
+        user_role: str = "unknown",
+        message: str,
+        channel: str,
+        store_id: str | None = None,
+    ) -> None:
+        """请求到达时立即落库用户消息，同时 upsert 会话元数据。原子事务。"""
+        if not message.strip():
+            return
+        if not await self._ensure_schema():
+            return
+        engine = self._get_engine()
+        if engine is None:
             return
 
-        async with pool.acquire() as conn:
+        insert_stmt = pg_insert(conversation_metadata_table).values(
+            thread_id=thread_id,
+            user_id=user_id,
+            user_role=user_role,
+            title=build_conversation_title(message),
+            channel=channel,
+            message_count=1,
+            message_source=UNIFIED_MESSAGE_SOURCE,
+            is_deleted=False,
+            deleted_at=None,
+        )
+        meta_stmt = insert_stmt.on_conflict_do_update(
+            index_elements=[conversation_metadata_table.c.thread_id],
+            set_={
+                "user_id": insert_stmt.excluded.user_id,
+                "user_role": insert_stmt.excluded.user_role,
+                "channel": insert_stmt.excluded.channel,
+                "last_message_at": func.now(),
+                "message_count": conversation_metadata_table.c.message_count + 1,
+                "message_source": UNIFIED_MESSAGE_SOURCE,
+                "is_deleted": False,
+                "deleted_at": None,
+                "title": case(
+                    (
+                        or_(
+                            conversation_metadata_table.c.title.is_(None),
+                            conversation_metadata_table.c.title == "",
+                        ),
+                        insert_stmt.excluded.title,
+                    ),
+                    else_=conversation_metadata_table.c.title,
+                ),
+            },
+        )
+        async with engine.begin() as conn:
             await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS conversation_metadata (
-                    thread_id VARCHAR(255) PRIMARY KEY,
-                    user_id VARCHAR(255),
-                    title VARCHAR(500),
-                    channel VARCHAR(50) DEFAULT 'web',
-                    created_at TIMESTAMPTZ DEFAULT NOW(),
-                    last_message_at TIMESTAMPTZ DEFAULT NOW(),
-                    message_count INTEGER DEFAULT 0,
-                    is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
-                    deleted_at TIMESTAMPTZ
+                conversation_messages_table.insert().values(
+                    thread_id=thread_id,
+                    user_id=user_id,
+                    channel=channel,
+                    store_id=store_id,
+                    role="user",
+                    content=message,
                 )
-                """
+            )
+            await conn.execute(meta_stmt)
+
+    async def save_assistant_message(
+        self,
+        *,
+        thread_id: str,
+        user_id: str,
+        channel: str,
+        store_id: str | None = None,
+        content: str,
+    ) -> None:
+        """AI 回复完成后落库 assistant 消息，同时更新元数据计数。原子事务。"""
+        if not content.strip():
+            return
+        if not await self._ensure_schema():
+            return
+        engine = self._get_engine()
+        if engine is None:
+            return
+
+        async with engine.begin() as conn:
+            await conn.execute(
+                conversation_messages_table.insert().values(
+                    thread_id=thread_id,
+                    user_id=user_id,
+                    channel=channel,
+                    store_id=store_id,
+                    role="assistant",
+                    content=content,
+                )
             )
             await conn.execute(
-                """
-                ALTER TABLE conversation_metadata
-                ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN NOT NULL DEFAULT FALSE
-                """
+                update(conversation_metadata_table)
+                .where(conversation_metadata_table.c.thread_id == thread_id)
+                .values(
+                    message_count=conversation_metadata_table.c.message_count + 1,
+                    last_message_at=func.now(),
+                )
             )
-            await conn.execute(
-                """
-                ALTER TABLE conversation_metadata
-                ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ
-                """
-            )
-            await conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_conv_meta_user_active
-                ON conversation_metadata(user_id, is_deleted, last_message_at DESC)
-                """
-            )
-        self._schema_ready = True
-
-    async def _fetchrow(self, query: str, *args):
-        pool = await self._get_pool()
-        if pool is None:
-            return None
-        async with pool.acquire() as conn:
-            return await conn.fetchrow(query, *args)
-
-    async def _fetch(self, query: str, *args):
-        pool = await self._get_pool()
-        if pool is None:
-            return []
-        async with pool.acquire() as conn:
-            return await conn.fetch(query, *args)
-
-    async def _execute(self, query: str, *args):
-        pool = await self._get_pool()
-        if pool is None:
-            return ""
-        async with pool.acquire() as conn:
-            return await conn.execute(query, *args)
 
     async def upsert_on_turn(
         self,
         *,
         thread_id: str,
         user_id: str,
+        user_role: str = "unknown",
         message: str,
         channel: str,
         increment: int = 2,
     ) -> dict:
-        title = build_conversation_title(message)
-        row = await self._fetchrow(
-            """
-            INSERT INTO conversation_metadata (
-                thread_id, user_id, title, channel, message_count, is_deleted, deleted_at
-            )
-            VALUES ($1, $2, $3, $4, $5, FALSE, NULL)
-            ON CONFLICT (thread_id) DO UPDATE
-            SET user_id = EXCLUDED.user_id,
-                channel = EXCLUDED.channel,
-                last_message_at = NOW(),
-                message_count = conversation_metadata.message_count + EXCLUDED.message_count,
-                is_deleted = FALSE,
-                deleted_at = NULL,
-                title = CASE
-                    WHEN conversation_metadata.title IS NULL
-                        OR conversation_metadata.title = ''
-                    THEN EXCLUDED.title
-                    ELSE conversation_metadata.title
-                END
-            RETURNING
-                thread_id,
-                user_id,
-                title,
-                channel,
-                created_at,
-                last_message_at,
-                message_count,
-                is_deleted,
-                deleted_at
-            """,
-            thread_id,
-            user_id,
-            title,
-            channel,
-            increment,
+        """兼容旧调用，仅更新会话索引。"""
+        insert_stmt = pg_insert(conversation_metadata_table).values(
+            thread_id=thread_id,
+            user_id=user_id,
+            user_role=user_role,
+            title=build_conversation_title(message),
+            channel=channel,
+            message_count=increment,
+            message_source=LEGACY_MESSAGE_SOURCE,
+            is_deleted=False,
+            deleted_at=None,
         )
+        stmt = insert_stmt.on_conflict_do_update(
+            index_elements=[conversation_metadata_table.c.thread_id],
+            set_={
+                "user_id": insert_stmt.excluded.user_id,
+                "user_role": insert_stmt.excluded.user_role,
+                "channel": insert_stmt.excluded.channel,
+                "last_message_at": func.now(),
+                "message_count": (
+                    conversation_metadata_table.c.message_count
+                    + insert_stmt.excluded.message_count
+                ),
+                "is_deleted": False,
+                "deleted_at": None,
+                "title": case(
+                    (
+                        or_(
+                            conversation_metadata_table.c.title.is_(None),
+                            conversation_metadata_table.c.title == "",
+                        ),
+                        insert_stmt.excluded.title,
+                    ),
+                    else_=conversation_metadata_table.c.title,
+                ),
+            },
+        ).returning(*_returning_summary())
+        row = await self._write_fetchrow(stmt)
         return _row_to_summary(row) or {}
 
-    async def list_by_user(self, user_id: str, limit: int = 20, offset: int = 0) -> dict:
-        rows = await self._fetch(
-            """
-            SELECT thread_id, user_id, title, channel, created_at, last_message_at,
-                   message_count, is_deleted, deleted_at
-            FROM conversation_metadata
-            WHERE user_id = $1 AND is_deleted = FALSE
-            ORDER BY last_message_at DESC
-            LIMIT $2 OFFSET $3
-            """,
-            user_id,
-            limit,
-            offset,
+    async def list_by_user(
+        self,
+        user_id: str,
+        limit: int = 20,
+        before: str | None = None,
+        after: str | None = None,
+    ) -> dict:
+        if before and after:
+            raise ValueError("before 和 after 不能同时传入")
+
+        safe_limit = max(1, min(limit, 100))
+        conditions = [
+            conversation_metadata_table.c.user_id == user_id,
+            conversation_metadata_table.c.is_deleted.is_(False),
+            conversation_metadata_table.c.message_source == UNIFIED_MESSAGE_SOURCE,
+        ]
+        order_by = [
+            conversation_metadata_table.c.last_message_at.desc(),
+            conversation_metadata_table.c.thread_id.desc(),
+        ]
+
+        if before:
+            cursor = _decode_cursor(before)
+            cursor_ts = _parse_cursor_timestamp(cursor["last_message_at"])
+            conditions.append(
+                or_(
+                    conversation_metadata_table.c.last_message_at < cursor_ts,
+                    and_(
+                        conversation_metadata_table.c.last_message_at == cursor_ts,
+                        conversation_metadata_table.c.thread_id < cursor["thread_id"],
+                    ),
+                )
+            )
+        elif after:
+            cursor = _decode_cursor(after)
+            cursor_ts = _parse_cursor_timestamp(cursor["last_message_at"])
+            conditions.append(
+                or_(
+                    conversation_metadata_table.c.last_message_at > cursor_ts,
+                    and_(
+                        conversation_metadata_table.c.last_message_at == cursor_ts,
+                        conversation_metadata_table.c.thread_id > cursor["thread_id"],
+                    ),
+                )
+            )
+            order_by = [
+                conversation_metadata_table.c.last_message_at.asc(),
+                conversation_metadata_table.c.thread_id.asc(),
+            ]
+
+        stmt = (
+            select(*_returning_summary())
+            .where(*conditions)
+            .order_by(*order_by)
+            .limit(safe_limit)
         )
+        items = [_row_to_summary(row) for row in await self._fetch(stmt)]
+        if after:
+            items.reverse()
+
         count_row = await self._fetchrow(
-            """
-            SELECT COUNT(*) AS total
-            FROM conversation_metadata
-            WHERE user_id = $1 AND is_deleted = FALSE
-            """,
-            user_id,
+            select(func.count().label("total"))
+            .select_from(conversation_metadata_table)
+            .where(
+                conversation_metadata_table.c.user_id == user_id,
+                conversation_metadata_table.c.is_deleted.is_(False),
+                conversation_metadata_table.c.message_source == UNIFIED_MESSAGE_SOURCE,
+            )
         )
+
+        has_more_older = False
+        has_more_newer = False
+        if items:
+            last_item = items[-1]
+            first_item = items[0]
+            last_ts = _parse_cursor_timestamp(last_item["last_message_at"])
+            first_ts = _parse_cursor_timestamp(first_item["last_message_at"])
+            older_probe = await self._fetch(
+                select(conversation_metadata_table.c.thread_id)
+                .where(
+                    conversation_metadata_table.c.user_id == user_id,
+                    conversation_metadata_table.c.is_deleted.is_(False),
+                    conversation_metadata_table.c.message_source == UNIFIED_MESSAGE_SOURCE,
+                    or_(
+                        conversation_metadata_table.c.last_message_at < last_ts,
+                        and_(
+                            conversation_metadata_table.c.last_message_at == last_ts,
+                            conversation_metadata_table.c.thread_id < last_item["thread_id"],
+                        ),
+                    ),
+                )
+                .order_by(
+                    conversation_metadata_table.c.last_message_at.desc(),
+                    conversation_metadata_table.c.thread_id.desc(),
+                )
+                .limit(1)
+            )
+            newer_probe = await self._fetch(
+                select(conversation_metadata_table.c.thread_id)
+                .where(
+                    conversation_metadata_table.c.user_id == user_id,
+                    conversation_metadata_table.c.is_deleted.is_(False),
+                    conversation_metadata_table.c.message_source == UNIFIED_MESSAGE_SOURCE,
+                    or_(
+                        conversation_metadata_table.c.last_message_at > first_ts,
+                        and_(
+                            conversation_metadata_table.c.last_message_at == first_ts,
+                            conversation_metadata_table.c.thread_id > first_item["thread_id"],
+                        ),
+                    ),
+                )
+                .order_by(
+                    conversation_metadata_table.c.last_message_at.asc(),
+                    conversation_metadata_table.c.thread_id.asc(),
+                )
+                .limit(1)
+            )
+            has_more_older = bool(older_probe)
+            has_more_newer = bool(newer_probe)
+
         return {
-            "items": [_row_to_summary(dict(row)) for row in rows],
+            "items": items,
             "total": int(count_row["total"]) if count_row else 0,
+            "paging": {
+                "older_cursor": _summary_cursor(items[-1]) if items else None,
+                "newer_cursor": _summary_cursor(items[0]) if items else None,
+                "has_more_older": has_more_older,
+                "has_more_newer": has_more_newer,
+            },
         }
 
     async def get_by_thread(
@@ -231,91 +583,229 @@ class ConversationStore:
         user_id: str | None = None,
         include_deleted: bool = False,
     ) -> dict | None:
-        conditions = ["thread_id = $1"]
-        args: list = [thread_id]
-        arg_index = 2
+        conditions = [conversation_metadata_table.c.thread_id == thread_id]
         if user_id is not None:
-            conditions.append(f"user_id = ${arg_index}")
-            args.append(user_id)
-            arg_index += 1
+            conditions.append(conversation_metadata_table.c.user_id == user_id)
         if not include_deleted:
-            conditions.append("is_deleted = FALSE")
-
-        row = await self._fetchrow(
-            f"""
-            SELECT thread_id, user_id, title, channel, created_at, last_message_at,
-                   message_count, is_deleted, deleted_at
-            FROM conversation_metadata
-            WHERE {' AND '.join(conditions)}
-            """,
-            *args,
-        )
+            conditions.append(conversation_metadata_table.c.is_deleted.is_(False))
+        row = await self._fetchrow(select(*_returning_summary()).where(*conditions))
         return _row_to_summary(row)
 
+    async def list_messages(
+        self,
+        *,
+        thread_id: str,
+        user_id: str | None = None,
+        limit: int = 50,
+        before: str | None = None,
+        after: str | None = None,
+    ) -> dict:
+        if before and after:
+            raise ValueError("before 和 after 不能同时传入")
+
+        safe_limit = max(1, min(limit, 200))
+        conditions = [conversation_messages_table.c.thread_id == thread_id]
+        if user_id is not None:
+            conditions.append(conversation_messages_table.c.user_id == user_id)
+        order_by = [
+            conversation_messages_table.c.created_at.desc(),
+            conversation_messages_table.c.id.desc(),
+        ]
+
+        if before:
+            cursor = _decode_cursor(before)
+            cursor_ts = _parse_cursor_timestamp(cursor["created_at"])
+            cursor_id = int(cursor["id"])
+            conditions.append(
+                or_(
+                    conversation_messages_table.c.created_at < cursor_ts,
+                    and_(
+                        conversation_messages_table.c.created_at == cursor_ts,
+                        conversation_messages_table.c.id < cursor_id,
+                    ),
+                )
+            )
+        elif after:
+            cursor = _decode_cursor(after)
+            cursor_ts = _parse_cursor_timestamp(cursor["created_at"])
+            cursor_id = int(cursor["id"])
+            conditions.append(
+                or_(
+                    conversation_messages_table.c.created_at > cursor_ts,
+                    and_(
+                        conversation_messages_table.c.created_at == cursor_ts,
+                        conversation_messages_table.c.id > cursor_id,
+                    ),
+                )
+            )
+            order_by = [
+                conversation_messages_table.c.created_at.asc(),
+                conversation_messages_table.c.id.asc(),
+            ]
+
+        stmt = (
+            select(
+                conversation_messages_table.c.id,
+                conversation_messages_table.c.role,
+                conversation_messages_table.c.content,
+                conversation_messages_table.c.created_at,
+            )
+            .where(*conditions)
+            .order_by(*order_by)
+            .limit(safe_limit)
+        )
+        items = [_row_to_message(row) for row in await self._fetch(stmt)]
+        if not after:
+            items.reverse()
+
+        count_conditions = [conversation_messages_table.c.thread_id == thread_id]
+        if user_id is not None:
+            count_conditions.append(conversation_messages_table.c.user_id == user_id)
+        count_row = await self._fetchrow(
+            select(func.count().label("total"))
+            .select_from(conversation_messages_table)
+            .where(*count_conditions)
+        )
+
+        has_more_older = False
+        has_more_newer = False
+        if items:
+            first_item = items[0]
+            last_item = items[-1]
+            first_ts = _parse_cursor_timestamp(first_item["created_at"])
+            last_ts = _parse_cursor_timestamp(last_item["created_at"])
+            first_id = int(first_item["id"])
+            last_id = int(last_item["id"])
+
+            older_conditions = list(count_conditions)
+            older_conditions.append(
+                or_(
+                    conversation_messages_table.c.created_at < first_ts,
+                    and_(
+                        conversation_messages_table.c.created_at == first_ts,
+                        conversation_messages_table.c.id < first_id,
+                    ),
+                )
+            )
+            newer_conditions = list(count_conditions)
+            newer_conditions.append(
+                or_(
+                    conversation_messages_table.c.created_at > last_ts,
+                    and_(
+                        conversation_messages_table.c.created_at == last_ts,
+                        conversation_messages_table.c.id > last_id,
+                    ),
+                )
+            )
+
+            older_probe = await self._fetch(
+                select(conversation_messages_table.c.id)
+                .where(*older_conditions)
+                .order_by(
+                    conversation_messages_table.c.created_at.desc(),
+                    conversation_messages_table.c.id.desc(),
+                )
+                .limit(1)
+            )
+            newer_probe = await self._fetch(
+                select(conversation_messages_table.c.id)
+                .where(*newer_conditions)
+                .order_by(
+                    conversation_messages_table.c.created_at.asc(),
+                    conversation_messages_table.c.id.asc(),
+                )
+                .limit(1)
+            )
+            has_more_older = bool(older_probe)
+            has_more_newer = bool(newer_probe)
+
+        return {
+            "items": items,
+            "total": int(count_row["total"]) if count_row else 0,
+            "paging": {
+                "older_cursor": _message_cursor(items[0]) if items else None,
+                "newer_cursor": _message_cursor(items[-1]) if items else None,
+                "has_more_older": has_more_older,
+                "has_more_newer": has_more_newer,
+            },
+        }
+
     async def rename(self, thread_id: str, user_id: str, title: str) -> dict | None:
-        row = await self._fetchrow(
-            """
-            UPDATE conversation_metadata
-            SET title = $3
-            WHERE thread_id = $1 AND user_id = $2 AND is_deleted = FALSE
-            RETURNING
-                thread_id,
-                user_id,
-                title,
-                channel,
-                created_at,
-                last_message_at,
-                message_count,
-                is_deleted,
-                deleted_at
-            """,
-            thread_id,
-            user_id,
-            title.strip(),
+        row = await self._write_fetchrow(
+            update(conversation_metadata_table)
+            .where(
+                conversation_metadata_table.c.thread_id == thread_id,
+                conversation_metadata_table.c.user_id == user_id,
+                conversation_metadata_table.c.is_deleted.is_(False),
+            )
+            .values(title=title.strip())
+            .returning(*_returning_summary())
         )
         return _row_to_summary(row)
 
     async def soft_delete(self, thread_id: str, user_id: str) -> bool:
-        status = await self._execute(
-            """
-            UPDATE conversation_metadata
-            SET is_deleted = TRUE, deleted_at = NOW()
-            WHERE thread_id = $1 AND user_id = $2 AND is_deleted = FALSE
-            """,
-            thread_id,
-            user_id,
+        rowcount = await self._execute(
+            update(conversation_metadata_table)
+            .where(
+                conversation_metadata_table.c.thread_id == thread_id,
+                conversation_metadata_table.c.user_id == user_id,
+                conversation_metadata_table.c.is_deleted.is_(False),
+            )
+            .values(is_deleted=True, deleted_at=func.now())
         )
-        return status.endswith("1")
+        return rowcount > 0
 
     async def close(self):
-        if self._pool:
-            await self._pool.close()
+        self._engine = None
 
 
 async def record_conversation_turn(
     *,
     thread_id: str,
     user_id: str,
-    message: str,
+    user_role: str = "unknown",
+    message: str | None = None,
+    assistant_message: str | None = None,
     channel: str,
+    store_id: str | None = None,
+    messages: list[dict[str, str]] | None = None,
 ) -> None:
     """记录一次成功完成的对话。"""
     if not user_id or not thread_id:
         return
+
+    normalized_messages = list(messages or [])
+    if not normalized_messages and message:
+        normalized_messages.append({"role": "user", "content": message})
+        if assistant_message:
+            normalized_messages.append({"role": "assistant", "content": assistant_message})
+
     try:
         store = get_conversation_store()
-        await store.upsert_on_turn(
-            thread_id=thread_id,
-            user_id=user_id,
-            message=message,
-            channel=channel,
-        )
-    except Exception as e:
+        record_messages = getattr(store, "record_messages", None)
+        if inspect.iscoroutinefunction(record_messages):
+            await record_messages(
+                thread_id=thread_id,
+                user_id=user_id,
+                user_role=user_role,
+                channel=channel,
+                store_id=store_id,
+                messages=normalized_messages,
+            )
+        else:
+            await store.upsert_on_turn(
+                thread_id=thread_id,
+                user_id=user_id,
+                user_role=user_role,
+                message=message or "",
+                channel=channel,
+            )
+    except Exception as exc:
         logger.warning(
             "记录会话元数据失败",
             thread_id=thread_id,
             user_id=user_id,
-            error=str(e),
+            error=str(exc),
         )
 
 

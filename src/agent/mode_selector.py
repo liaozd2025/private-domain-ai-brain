@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
+from pathlib import Path
 from typing import Literal
 
 import structlog
@@ -39,6 +41,20 @@ CHAT_PATTERNS = [
     r"^帮我写",
     r"^写一份",
 ]
+
+# 门店经营数据检测 — 文件名关键词
+_STORE_OP_FILENAME_KEYWORDS = (
+    "门店经营", "五大指标", "行动计划", "门店诊断",
+    "经营数据", "门店数据", "销售数据", "经营报告",
+)
+
+# 门店经营数据检测 — 列头关键词（至少命中 2 个才触发，降低误判）
+_STORE_OP_COLUMN_KEYWORDS = (
+    "客流量", "成交率", "成交均价", "体验率",
+    "营业额", "毛利率", "经营利润", "人头数",
+    "门店名称", "店名",
+)
+_STORE_OP_COLUMN_MIN_HITS = 2
 
 
 class LLMModeDecision(BaseModel):
@@ -104,6 +120,16 @@ class ModeSelector:
                 reason="命中模式选择规则",
             )
 
+        # 附件包含门店经营数据 → 强制 plan 模式
+        if attachments and self._detect_store_operation_data(attachments):
+            return self._build_result(
+                requested_mode="auto",
+                resolved_mode="plan",
+                selection_source="heuristic",
+                confidence=0.95,
+                reason="附件包含门店经营数据，自动切换为 plan 模式",
+            )
+
         attachment_summary = ", ".join(
             attachment.get("file_type", "unknown")
             for attachment in (attachments or [])
@@ -140,6 +166,38 @@ class ModeSelector:
                 confidence=0.0,
                 reason=f"自动模式选择失败，保守降级: {str(exc)}",
             )
+
+    def _detect_store_operation_data(self, attachments: list[dict]) -> bool:
+        """判断附件是否为门店经营数据（文件名关键词 or 列头 peek）。"""
+        tabular_exts = {".xlsx", ".xls", ".csv"}
+
+        for att in attachments:
+            filename = att.get("filename", "").lower()
+            file_path = att.get("file_path", "")
+            ext = Path(file_path).suffix.lower() if file_path else ""
+
+            # 1. 文件名关键词（无 I/O）
+            if any(kw in filename for kw in _STORE_OP_FILENAME_KEYWORDS):
+                logger.debug("门店经营数据命中(文件名)", filename=filename)
+                return True
+
+            # 2. 列头 peek（仅读首行，I/O 极小）
+            if ext in tabular_exts and file_path:
+                try:
+                    import pandas as _pd
+                    if ext in (".xlsx", ".xls"):
+                        cols = _pd.read_excel(file_path, nrows=0).columns.tolist()
+                    else:
+                        cols = _pd.read_csv(file_path, nrows=0).columns.tolist()
+                    cols_str = " ".join(str(c) for c in cols)
+                    hits = sum(1 for kw in _STORE_OP_COLUMN_KEYWORDS if kw in cols_str)
+                    if hits >= _STORE_OP_COLUMN_MIN_HITS:
+                        logger.debug("门店经营数据命中(列头)", cols=cols[:10], hits=hits)
+                        return True
+                except Exception as exc:
+                    logger.debug("列头 peek 失败，跳过", file=file_path, error=str(exc))
+
+        return False
 
     def _resolve_by_heuristic(self, message: str) -> ResolvedMode | None:
         normalized = re.sub(r"\s+", " ", message).strip().lower()
@@ -189,11 +247,15 @@ class ModeSelector:
 
 
 _mode_selector: ModeSelector | None = None
+_mode_selector_lock = asyncio.Lock()
 
 
 async def get_mode_selector() -> ModeSelector:
     global _mode_selector
-    if _mode_selector is None:
-        _mode_selector = ModeSelector()
-        logger.info("Mode selector 初始化完成")
+    if _mode_selector is not None:
+        return _mode_selector
+    async with _mode_selector_lock:
+        if _mode_selector is None:
+            _mode_selector = ModeSelector()
+            logger.info("Mode selector 初始化完成")
     return _mode_selector

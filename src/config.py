@@ -1,6 +1,6 @@
 """配置中心 - 所有环境变量和系统配置的单一入口"""
 
-from enum import Enum
+from enum import StrEnum
 from functools import lru_cache
 from typing import Literal
 
@@ -8,7 +8,7 @@ from pydantic import Field, computed_field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-class LLMProvider(str, Enum):
+class LLMProvider(StrEnum):
     CLAUDE = "claude"
     QWEN = "qwen"
     OPENAI = "openai"
@@ -53,6 +53,14 @@ class Settings(BaseSettings):
 
     @computed_field
     @property
+    def database_url_async(self) -> str:
+        return (
+            f"postgresql+psycopg://{self.postgres_user}:{self.postgres_password}"
+            f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
+        )
+
+    @computed_field
+    @property
     def database_url_sync(self) -> str:
         """同步连接 URL，用于 LangGraph checkpointer"""
         return (
@@ -81,6 +89,11 @@ class Settings(BaseSettings):
     reranker_model: str = Field(default="BAAI/bge-reranker-v2-m3")
     embedding_device: str = Field(default="cpu")
     embedding_dim: int = Field(default=1024, description="bge-large-zh 维度")
+    hf_token: str = Field(default="")
+
+    # ===== 硅基流动（Embedding API）=====
+    siliconflow_api_key: str = Field(default="", description="硅基流动 API Key")
+    siliconflow_base_url: str = Field(default="https://api.siliconflow.cn/v1")
 
     # ===== 文件存储 =====
     upload_dir: str = Field(default="./uploads")
@@ -90,6 +103,13 @@ class Settings(BaseSettings):
     @property
     def max_upload_size_bytes(self) -> int:
         return self.max_upload_size_mb * 1024 * 1024
+
+    # ===== 阿里云 OSS =====
+    oss_access_key_id: str = Field(default="")
+    oss_access_key_secret: str = Field(default="")
+    oss_bucket_name: str = Field(default="")
+    oss_endpoint: str = Field(default="")  # e.g. https://oss-cn-hangzhou.aliyuncs.com
+    oss_prefix: str = Field(default="uploads/")
 
     # ===== API 配置 =====
     api_host: str = Field(default="0.0.0.0")
@@ -108,6 +128,7 @@ class Settings(BaseSettings):
     # ===== OpenClaw 配置 =====
     openclaw_base_url: str = Field(default="https://api.openclaw.io")
     openclaw_api_key: str = Field(default="")
+    openclaw_webhook_secret: str = Field(default="")
 
     # ===== 监控 =====
     langfuse_host: str = Field(default="https://cloud.langfuse.com")
@@ -119,6 +140,7 @@ class Settings(BaseSettings):
     app_env: Literal["development", "staging", "production"] = Field(default="development")
     log_level: str = Field(default="INFO")
     secret_key: str = Field(default="change-this-in-production")
+    auth_enabled: bool = Field(default=True, description="启用 API 身份认证，开发环境可设为 False")
 
     @computed_field
     @property

@@ -1,3 +1,8 @@
+---
+name: content-generation
+description: Use when generating private-domain operational content such as 活动方案、SOP、销售话术、朋友圈文案、小红书笔记、企微推文、抖音脚本 and channel-specific copy.
+---
+
 # 内容生成技能规范 (SKILL.md)
 
 ## 支持内容类型

@@ -68,8 +68,8 @@ async def extract_and_update_profile(
             for m in recent_messages
         ])
 
-        # 调用 LLM 提取
-        extraction_llm = llm.with_structured_output(ProfileExtractionResult)
+        # 调用 LLM 提取（json_mode 避免 OpenAI function-calling 路径产生 parsed 字段序列化警告）
+        extraction_llm = llm.with_structured_output(ProfileExtractionResult, method="json_mode")
         from langchain_core.messages import HumanMessage as HM
         result = await extraction_llm.ainvoke([
             HM(content=EXTRACTION_PROMPT.format(conversation=conversation))

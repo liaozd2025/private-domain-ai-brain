@@ -8,9 +8,11 @@
   GET /health - 健康检查
 """
 
+import mimetypes
 import uuid
 from pathlib import Path
 
+import anyio
 import structlog
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile
 
@@ -22,8 +24,15 @@ from src.api.schemas import (
     ConversationRenameRequest,
     ConversationSummary,
     FileUploadResponse,
+    HandoffClaimRequest,
+    HandoffDetail,
+    HandoffListResponse,
+    HandoffReplyRequest,
+    HandoffResolveRequest,
+    HandoffSummary,
     HealthResponse,
     MessageItem,
+    PagingInfo,
     UserProfile,
     UserProfileUpdate,
 )
@@ -31,8 +40,16 @@ from src.config import settings
 from src.memory.attachments import (
     AttachmentAccessError,
     AttachmentNotFoundError,
-    resolve_attachment_refs,
-    save_attachment_metadata,
+    AttachmentStorageError,
+    resolve_attachment_refs_from_db,
+)
+from src.memory.db import ensure_managed_schema, get_async_engine, uploaded_files_table
+from src.storage.oss import (
+    OSSStorageError,
+    build_object_key,
+)
+from src.storage.oss import (
+    upload_bytes as oss_upload_bytes,
 )
 
 logger = structlog.get_logger(__name__)
@@ -59,6 +76,65 @@ async def get_mode_selector_dep():
     return await get_mode_selector()
 
 
+async def get_customer_service_supervisor_dep():
+    """获取客服编排器依赖。"""
+    from src.agent.customer_service import get_customer_service_supervisor
+    return await get_customer_service_supervisor()
+
+
+async def get_customer_service_store_dep():
+    """获取客服存储依赖。"""
+    from src.memory.customer_service import get_customer_service_store
+    return get_customer_service_store()
+
+
+def _is_customer_role(user_role: str) -> bool:
+    return user_role == "customer"
+
+
+def _customer_sender_to_role(sender_type: str) -> str:
+    mapping = {
+        "customer": "user",
+        "ai": "assistant",
+        "human": "human",
+        "system": "system",
+    }
+    return mapping.get(sender_type, "assistant")
+
+
+async def _check_database_health() -> str:
+    """检查数据库连接状态，不向调用方暴露底层异常。"""
+    try:
+        from src.memory.checkpointer import get_checkpointer
+
+        await get_checkpointer()
+        return "ok"
+    except Exception as e:
+        logger.warning("数据库健康检查失败", error=str(e))
+        return "error"
+
+
+async def _check_milvus_health() -> str:
+    """检查 Milvus 连接状态，不向调用方暴露底层异常。"""
+    alias = "healthcheck"
+    try:
+        from pymilvus import connections, utility
+
+        connections.connect(alias=alias, **settings.milvus_connection_args)
+        utility.has_collection(settings.milvus_collection_name, using=alias)
+        return "ok"
+    except Exception as e:
+        logger.warning("Milvus 健康检查失败", error=str(e))
+        return "error"
+    finally:
+        try:
+            from pymilvus import connections
+
+            connections.disconnect(alias)
+        except Exception:
+            pass
+
+
 # ===== 聊天端点 =====
 
 @router.post("/chat", response_model=ChatResponse)
@@ -67,10 +143,11 @@ async def chat(
     orchestrator=Depends(get_orchestrator_dep),
     plan_runner=Depends(get_plan_runner_dep),
     mode_selector=Depends(get_mode_selector_dep),
+    customer_service_supervisor=Depends(get_customer_service_supervisor_dep),
 ):
     """发送消息，获取 AI 回答（同步模式）
 
-    对于流式响应，请使用 WebSocket 端点 /chat/stream
+    对于流式响应，请使用 SSE 端点 POST /chat/stream
     """
     thread_id = request.get_thread_id()
 
@@ -83,9 +160,59 @@ async def chat(
     )
 
     try:
-        resolved_attachments = resolve_attachment_refs(
+        resolved_attachments = await resolve_attachment_refs_from_db(
             [a.model_dump() for a in request.attachments],
             request.user_id,
+        )
+
+        if _is_customer_role(request.user_role):
+            from src.memory.conversations import get_conversation_store
+
+            store = get_conversation_store()
+            await store.save_user_message(
+                thread_id=thread_id,
+                user_id=request.user_id,
+                user_role=request.user_role,
+                message=request.message,
+                channel=request.channel,
+                store_id=request.store_id,
+            )
+            result = await customer_service_supervisor.invoke(
+                message=request.message,
+                thread_id=thread_id,
+                user_id=request.user_id,
+                channel=request.channel,
+                store_id=request.store_id,
+            )
+            try:
+                await store.save_assistant_message(
+                    thread_id=thread_id,
+                    user_id=request.user_id,
+                    channel=request.channel,
+                    store_id=request.store_id,
+                    content=result.content,
+                )
+            except Exception as _exc:
+                logger.warning("保存 assistant 消息失败", thread_id=thread_id, error=str(_exc))
+            return ChatResponse(
+                thread_id=thread_id,
+                message_id=f"msg_{uuid.uuid4().hex[:12]}",
+                content=result.content,
+                mode="chat",
+                requested_mode=request.mode,
+                resolved_mode="chat",
+            )
+
+        from src.memory.conversations import get_conversation_store
+
+        store = get_conversation_store()
+        await store.save_user_message(
+            thread_id=thread_id,
+            user_id=request.user_id,
+            user_role=request.user_role,
+            message=request.message,
+            channel=request.channel,
+            store_id=request.store_id,
         )
 
         mode_decision = await mode_selector.resolve_mode(
@@ -104,16 +231,19 @@ async def chat(
                 user_id=request.user_id,
                 user_role=request.user_role,
                 channel=request.channel,
+                store_id=request.store_id,
                 attachments=resolved_attachments,
             )
-            from src.memory.conversations import record_conversation_turn
-
-            await record_conversation_turn(
-                thread_id=thread_id,
-                user_id=request.user_id,
-                message=request.message,
-                channel=request.channel,
-            )
+            try:
+                await store.save_assistant_message(
+                    thread_id=thread_id,
+                    user_id=request.user_id,
+                    channel=request.channel,
+                    store_id=request.store_id,
+                    content=response.content,
+                )
+            except Exception as _exc:
+                logger.warning("保存 assistant 消息失败", thread_id=thread_id, error=str(_exc))
             return ChatResponse(
                 thread_id=thread_id,
                 message_id=f"msg_{uuid.uuid4().hex[:12]}",
@@ -131,17 +261,19 @@ async def chat(
             user_id=request.user_id,
             user_role=request.user_role,
             channel=request.channel,
+            store_id=request.store_id,
             attachments=resolved_attachments,
         )
-
-        from src.memory.conversations import record_conversation_turn
-
-        await record_conversation_turn(
-            thread_id=thread_id,
-            user_id=request.user_id,
-            message=request.message,
-            channel=request.channel,
-        )
+        try:
+            await store.save_assistant_message(
+                thread_id=thread_id,
+                user_id=request.user_id,
+                channel=request.channel,
+                store_id=request.store_id,
+                content=response,
+            )
+        except Exception as _exc:
+            logger.warning("保存 assistant 消息失败", thread_id=thread_id, error=str(_exc))
 
         return ChatResponse(
             thread_id=thread_id,
@@ -156,9 +288,12 @@ async def chat(
         raise HTTPException(status_code=403, detail=str(e))
     except AttachmentNotFoundError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except AttachmentStorageError as e:
+        logger.error("聊天附件从 OSS 获取失败", error=str(e), thread_id=thread_id)
+        raise HTTPException(status_code=503, detail="文件存储服务暂时不可用，请稍后重试")
     except Exception as e:
         logger.error("聊天请求失败", error=str(e), thread_id=thread_id)
-        raise HTTPException(status_code=500, detail=f"处理失败: {str(e)}")
+        raise HTTPException(status_code=500, detail="请求处理失败，请稍后重试")
 
 
 # ===== 文件上传 =====
@@ -203,25 +338,29 @@ async def upload_file(
             detail=f"文件过大，最大支持 {settings.max_upload_size_mb}MB",
         )
 
-    # 保存文件
+    # 上传到 OSS
     file_id = uuid.uuid4().hex
-    upload_path = Path(settings.upload_dir) / user_id
-    upload_path.mkdir(parents=True, exist_ok=True)
+    object_key = build_object_key(user_id, file_id, suffix)
+    content_type = mimetypes.guess_type(file.filename or "")[0] or "application/octet-stream"
+    try:
+        await anyio.to_thread.run_sync(lambda: oss_upload_bytes(object_key, content, content_type))
+    except OSSStorageError as e:
+        logger.error("OSS 文件上传失败", user_id=user_id, filename=file.filename, error=str(e))
+        raise HTTPException(status_code=503, detail="文件存储服务暂时不可用，请稍后重试") from e
 
-    safe_filename = f"{file_id}{suffix}"
-    file_path = upload_path / safe_filename
-
-    with open(file_path, "wb") as f:
-        f.write(content)
-
-    save_attachment_metadata(
-        file_id=file_id,
-        user_id=user_id,
-        filename=file.filename,
-        file_type=allowed_types[suffix],
-        file_path=str(file_path),
-        thread_id=thread_id,
-    )
+    await ensure_managed_schema()
+    async with get_async_engine().begin() as conn:
+        await conn.execute(
+            uploaded_files_table.insert().values(
+                file_id=file_id,
+                thread_id=thread_id,
+                user_id=user_id,
+                filename=file.filename,
+                file_path=object_key,
+                file_type=allowed_types[suffix],
+                file_size_bytes=len(content),
+            )
+        )
 
     logger.info(
         "文件上传成功",
@@ -229,6 +368,7 @@ async def upload_file(
         filename=file.filename,
         size_bytes=len(content),
         user_id=user_id,
+        oss_key=object_key,
     )
 
     return FileUploadResponse(
@@ -246,16 +386,26 @@ async def upload_file(
 async def list_conversations(
     user_id: str,
     limit: int = 20,
-    offset: int = 0,
+    before: str | None = None,
+    after: str | None = None,
 ):
     """获取用户会话列表。"""
     from src.memory.conversations import get_conversation_store
 
     store = get_conversation_store()
-    result = await store.list_by_user(user_id=user_id, limit=limit, offset=offset)
+    try:
+        result = await store.list_by_user(
+            user_id=user_id,
+            limit=limit,
+            before=before,
+            after=after,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     return ConversationListResponse(
         items=[ConversationSummary(**item) for item in result["items"]],
         total=result["total"],
+        paging=PagingInfo(**result.get("paging", {})),
     )
 
 
@@ -264,10 +414,11 @@ async def get_conversation(
     thread_id: str,
     limit: int = 50,
     user_id: str | None = None,
+    before: str | None = None,
+    after: str | None = None,
 ):
     """获取对话历史"""
     try:
-        from src.memory.checkpointer import get_checkpointer
         from src.memory.conversations import get_conversation_store
 
         store = get_conversation_store()
@@ -280,44 +431,45 @@ async def get_conversation(
             raise HTTPException(status_code=404, detail="对话不存在")
         if metadata and metadata["is_deleted"]:
             raise HTTPException(status_code=404, detail="对话不存在")
-
-        checkpointer = await get_checkpointer()
-
-        config = {"configurable": {"thread_id": thread_id}}
-        checkpoint = await checkpointer.aget(config)
-
-        if not checkpoint:
+        if metadata is None or metadata.get("message_source") != "unified":
             raise HTTPException(status_code=404, detail="对话不存在")
 
-        messages = checkpoint.get("channel_values", {}).get("messages", [])
-
-        message_items = []
-        for msg in messages[-limit:]:
-            from langchain_core.messages import AIMessage, HumanMessage
-            if isinstance(msg, HumanMessage):
-                role = "user"
-            elif isinstance(msg, AIMessage):
-                role = "assistant"
-            else:
-                continue
-            message_items.append(MessageItem(role=role, content=str(msg.content)))
+        message_result = await store.list_messages(
+            thread_id=thread_id,
+            user_id=user_id,
+            limit=limit,
+            before=before,
+            after=after,
+        )
+        message_items = [
+            MessageItem(
+                id=item["id"],
+                role=item["role"],
+                content=item["content"],
+                created_at=item.get("created_at"),
+            )
+            for item in message_result["items"]
+        ]
 
         return ConversationHistory(
             thread_id=thread_id,
-            title=metadata["title"] if metadata else None,
-            channel=metadata["channel"] if metadata else None,
-            created_at=metadata["created_at"] if metadata else None,
-            last_message_at=metadata["last_message_at"] if metadata else None,
-            message_count=metadata["message_count"] if metadata else len(message_items),
+            title=metadata["title"],
+            channel=metadata["channel"],
+            created_at=metadata["created_at"],
+            last_message_at=metadata["last_message_at"],
+            message_count=metadata["message_count"],
             messages=message_items,
-            total=len(message_items),
+            total=message_result["total"],
+            paging=PagingInfo(**message_result.get("paging", {})),
         )
 
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except HTTPException:
         raise
     except Exception as e:
         logger.error("获取对话历史失败", thread_id=thread_id, error=str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="获取对话历史失败，请稍后重试")
 
 
 @router.patch("/conversations/{thread_id}", response_model=ConversationSummary)
@@ -346,6 +498,104 @@ async def delete_conversation(thread_id: str, user_id: str):
     if not deleted:
         raise HTTPException(status_code=404, detail="对话不存在")
     return Response(status_code=204)
+
+
+@router.get("/handoffs", response_model=HandoffListResponse)
+async def list_handoffs(
+    status: str | None = None,
+    channel: str | None = None,
+    limit: int = 20,
+    offset: int = 0,
+    customer_service_store=Depends(get_customer_service_store_dep),
+):
+    """获取人工接管队列。"""
+    result = await customer_service_store.list_handoffs(
+        status=status,
+        channel=channel,
+        limit=limit,
+        offset=offset,
+    )
+    return HandoffListResponse(
+        items=[HandoffSummary(**item) for item in result["items"]],
+        total=result["total"],
+    )
+
+
+@router.get("/handoffs/{handoff_id}", response_model=HandoffDetail)
+async def get_handoff_detail(
+    handoff_id: str,
+    customer_service_store=Depends(get_customer_service_store_dep),
+):
+    """获取人工接管详情。"""
+    detail = await customer_service_store.get_handoff_detail(handoff_id)
+    if not detail:
+        raise HTTPException(status_code=404, detail="接管记录不存在")
+    return HandoffDetail(**detail)
+
+
+@router.post("/handoffs/{handoff_id}/claim", response_model=HandoffSummary)
+async def claim_handoff(
+    handoff_id: str,
+    request: HandoffClaimRequest,
+    customer_service_store=Depends(get_customer_service_store_dep),
+):
+    """人工领取会话。"""
+    handoff = await customer_service_store.claim_handoff(
+        handoff_id=handoff_id,
+        agent_id=request.agent_id,
+    )
+    if not handoff:
+        raise HTTPException(status_code=404, detail="接管记录不存在")
+    return HandoffSummary(**handoff)
+
+
+@router.post("/handoffs/{handoff_id}/reply", response_model=HandoffSummary)
+async def reply_handoff(
+    handoff_id: str,
+    request: HandoffReplyRequest,
+    customer_service_store=Depends(get_customer_service_store_dep),
+):
+    """人工回复客户。"""
+    handoff = await customer_service_store.reply_to_handoff(
+        handoff_id=handoff_id,
+        agent_id=request.agent_id,
+        content=request.content,
+        resolve_after_reply=request.resolve_after_reply,
+    )
+    if not handoff:
+        raise HTTPException(status_code=404, detail="接管记录不存在")
+
+    if handoff["channel"] == "wecom":
+        from src.api.webhooks import send_wecom_message
+
+        await send_wecom_message(to_user=handoff["user_id"], content=request.content)
+    elif handoff["channel"] == "openclaw":
+        from src.api.webhooks import send_openclaw_message
+
+        await send_openclaw_message(
+            user_id=handoff["user_id"],
+            channel=handoff["channel"],
+            content=request.content,
+        )
+
+    return HandoffSummary(**handoff)
+
+
+@router.post("/handoffs/{handoff_id}/resolve", response_model=HandoffSummary)
+async def resolve_handoff(
+    handoff_id: str,
+    request: HandoffResolveRequest,
+    customer_service_store=Depends(get_customer_service_store_dep),
+):
+    """结束人工接管。"""
+    handoff = await customer_service_store.resolve_handoff(
+        handoff_id=handoff_id,
+        agent_id=request.agent_id,
+        resolution_note=request.resolution_note,
+    )
+    if not handoff:
+        raise HTTPException(status_code=404, detail="接管记录不存在")
+    return HandoffSummary(**handoff)
 
 
 # ===== 用户画像 =====
@@ -383,22 +633,14 @@ async def update_user_profile(user_id: str, updates: UserProfileUpdate):
 @router.get("/health", response_model=HealthResponse)
 async def health_check():
     """服务健康检查"""
-    components = {}
-
-    # 检查数据库
-    try:
-        from src.memory.checkpointer import get_checkpointer
-        await get_checkpointer()
-        components["database"] = "ok"
-    except Exception as e:
-        components["database"] = f"error: {str(e)}"
-
-    # 检查 Milvus（懒加载，不强制连接）
-    components["milvus"] = "not_checked"
+    components = {
+        "database": await _check_database_health(),
+        "milvus": await _check_milvus_health(),
+    }
 
     overall = (
         "ok"
-        if all(v == "ok" or v == "not_checked" for v in components.values())
+        if all(v == "ok" for v in components.values())
         else "degraded"
     )
 

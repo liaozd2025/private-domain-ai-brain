@@ -1,163 +1,156 @@
-"""用户画像持久化 - PostgreSQL 存储
+"""用户画像持久化 - SQLAlchemy Async Core。"""
 
-功能：
-  - 读取/写入用户角色、偏好、历史话题
-  - 使用 namespace 隔离不同用户数据
-  - 异步非阻塞操作
-"""
+from __future__ import annotations
 
-import json
-from typing import Optional
+from typing import Any
 
 import structlog
+from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from src.config import settings
+from src.memory.db import ensure_managed_schema, get_async_engine, user_profiles_table
 
 logger = structlog.get_logger(__name__)
 
 
+def _decode_json_field(value: Any, default):
+    if value is None:
+        return default
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        import json
+
+        return json.loads(value)
+    except Exception:
+        return default
+
+
 class UserProfileStore:
-    """用户画像存储，直接操作 PostgreSQL"""
+    """用户画像存储。"""
 
     def __init__(self):
-        self._pool = None
-        self._disabled_reason: Optional[str] = None
+        self._engine = None
+        self._disabled_reason: str | None = None
         self._logged_disabled_reason = False
 
     def _disable(self, reason: str, *, error: str = "") -> None:
-        """禁用存储能力，避免重复初始化和重复报错"""
+        """禁用存储能力，避免重复初始化和重复报错。"""
         self._disabled_reason = reason
         if not self._logged_disabled_reason:
             logger.warning("用户画像存储已降级", reason=reason, error=error)
             self._logged_disabled_reason = True
 
-    async def _get_pool(self):
-        """获取数据库连接池（懒加载）"""
+    def _get_engine(self):
+        """获取共享 async engine。"""
         if self._disabled_reason:
             return None
-
-        if self._pool is None:
+        if self._engine is None:
             try:
-                import asyncpg
-            except ModuleNotFoundError as e:
-                self._disable("asyncpg_unavailable", error=str(e))
+                self._engine = get_async_engine()
+            except Exception as exc:
+                self._disable("engine_init_failed", error=str(exc))
                 return None
+        return self._engine
 
-            try:
-                self._pool = await asyncpg.create_pool(
-                    host=settings.postgres_host,
-                    port=settings.postgres_port,
-                    database=settings.postgres_db,
-                    user=settings.postgres_user,
-                    password=settings.postgres_password,
-                    max_size=10,
-                )
-            except Exception as e:
-                self._disable("pool_init_failed", error=str(e))
-                return None
-        return self._pool
+    async def _ensure_schema(self) -> bool:
+        engine = self._get_engine()
+        if engine is None:
+            return False
+        try:
+            await ensure_managed_schema()
+        except Exception as exc:
+            self._disable("schema_init_failed", error=str(exc))
+            return False
+        return True
 
     async def get_profile(self, user_id: str) -> dict:
-        """获取用户画像
-
-        Args:
-            user_id: 用户 ID
-
-        Returns:
-            用户画像字典，包含 role/preferences/topics
-        """
+        """获取用户画像。"""
         if not user_id:
             return {}
 
         try:
-            pool = await self._get_pool()
-            if pool is None:
+            if not await self._ensure_schema():
                 return {}
-            async with pool.acquire() as conn:
-                row = await conn.fetchrow(
-                    "SELECT role, preferences, topics FROM user_profiles WHERE user_id = $1",
-                    user_id,
+            engine = self._get_engine()
+            if engine is None:
+                return {}
+            stmt = (
+                select(
+                    user_profiles_table.c.role,
+                    user_profiles_table.c.preferences,
+                    user_profiles_table.c.topics,
                 )
-                if not row:
-                    return {}
-
-                return {
-                    "role": row["role"],
-                    "preferences": json.loads(row["preferences"]) if row["preferences"] else {},
-                    "topics": json.loads(row["topics"]) if row["topics"] else [],
-                }
-        except Exception as e:
-            logger.warning("获取用户画像失败", user_id=user_id, error=str(e))
+                .where(user_profiles_table.c.user_id == user_id)
+            )
+            async with engine.connect() as conn:
+                row = (await conn.execute(stmt)).mappings().first()
+            if not row:
+                return {}
+            return {
+                "role": row["role"],
+                "preferences": _decode_json_field(row["preferences"], {}),
+                "topics": _decode_json_field(row["topics"], []),
+            }
+        except Exception as exc:
+            logger.warning("获取用户画像失败", user_id=user_id, error=str(exc))
             return {}
 
     async def update_profile(self, user_id: str, updates: dict) -> bool:
-        """更新用户画像（UPSERT）
-
-        Args:
-            user_id: 用户 ID
-            updates: 要更新的字段，支持 role/preferences/topics
-
-        Returns:
-            是否更新成功
-        """
+        """更新用户画像（UPSERT）。"""
         if not user_id:
             return False
 
         try:
-            pool = await self._get_pool()
-            if pool is None:
+            if not await self._ensure_schema():
                 return False
-            async with pool.acquire() as conn:
-                # 获取现有画像
-                existing = await self.get_profile(user_id)
+            engine = self._get_engine()
+            if engine is None:
+                return False
 
-                # 合并更新
-                role = updates.get("role", existing.get("role", "unknown"))
-                preferences = {**existing.get("preferences", {}), **updates.get("preferences", {})}
-                topics = existing.get("topics", [])
+            existing = await self.get_profile(user_id)
+            role = updates.get("role", existing.get("role", "unknown"))
+            preferences = {**existing.get("preferences", {}), **updates.get("preferences", {})}
+            topics = list(existing.get("topics", []))
+            for topic in updates.get("topics", []):
+                if topic not in topics:
+                    topics.append(topic)
+            topics = topics[-20:]
 
-                # 新话题追加（去重，保留最近 20 个）
-                new_topics = updates.get("topics", [])
-                for topic in new_topics:
-                    if topic not in topics:
-                        topics.append(topic)
-                topics = topics[-20:]  # 只保留最近 20 个
+            insert_stmt = pg_insert(user_profiles_table).values(
+                user_id=user_id,
+                role=role,
+                preferences=preferences,
+                topics=topics,
+            )
+            stmt = insert_stmt.on_conflict_do_update(
+                index_elements=[user_profiles_table.c.user_id],
+                set_={
+                    "role": role,
+                    "preferences": preferences,
+                    "topics": topics,
+                    "updated_at": func.now(),
+                },
+            )
+            async with engine.begin() as conn:
+                await conn.execute(stmt)
 
-                await conn.execute(
-                    """
-                    INSERT INTO user_profiles (user_id, role, preferences, topics)
-                    VALUES ($1, $2, $3, $4)
-                    ON CONFLICT (user_id) DO UPDATE
-                    SET role = $2,
-                        preferences = $3,
-                        topics = $4,
-                        updated_at = NOW()
-                    """,
-                    user_id,
-                    role,
-                    json.dumps(preferences, ensure_ascii=False),
-                    json.dumps(topics, ensure_ascii=False),
-                )
-
-                logger.debug("用户画像已更新", user_id=user_id, role=role)
-                return True
-
-        except Exception as e:
-            logger.error("更新用户画像失败", user_id=user_id, error=str(e))
+            logger.debug("用户画像已更新", user_id=user_id, role=role)
+            return True
+        except Exception as exc:
+            logger.error("更新用户画像失败", user_id=user_id, error=str(exc))
             return False
 
     async def close(self):
-        """关闭连接池"""
-        if self._pool:
-            await self._pool.close()
+        """共享 engine 由应用生命周期统一关闭。"""
+        self._engine = None
 
 
-# 全局单例
-_profile_store: Optional[UserProfileStore] = None
+_profile_store: UserProfileStore | None = None
 
 
 def get_profile_store() -> UserProfileStore:
-    """获取全局用户画像存储实例"""
+    """获取全局用户画像存储实例。"""
     global _profile_store
     if _profile_store is None:
         _profile_store = UserProfileStore()

@@ -11,13 +11,21 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
 
+import anyio
 import httpx
 import structlog
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from src.config import settings
+from src.memory.attachments import materialize_attachment_from_oss
+from src.storage.oss import (
+    OSSStorageError,
+    build_object_key,
+)
+from src.storage.oss import (
+    upload_bytes as oss_upload_bytes,
+)
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -44,6 +52,9 @@ class OpenAIChatCompletionRequest(BaseModel):
     messages: list[OpenAIMessage] = Field(min_length=1)
     stream: bool = False
     user: str | None = None
+    thread_id: str | None = None
+    user_role: str | None = None
+    store_id: str | None = None
     tools: list[dict[str, Any]] | None = None
     tool_choice: str | dict[str, Any] | None = None
     response_format: dict[str, Any] | None = None
@@ -51,6 +62,7 @@ class OpenAIChatCompletionRequest(BaseModel):
     logprobs: bool | None = None
     audio: dict[str, Any] | None = None
     modalities: list[str] | None = None
+    metadata: dict[str, Any] | None = None
 
 
 def _reject_unsupported_fields(payload: OpenAIChatCompletionRequest) -> None:
@@ -84,6 +96,123 @@ def _build_messages_prompt(messages: list[tuple[str, str]]) -> str:
     return "\n\n".join(sections)
 
 
+def _extract_message_text(message: OpenAIMessage) -> str:
+    if isinstance(message.content, str) or message.content is None:
+        return (message.content or "").strip()
+
+    parts: list[str] = []
+    for part in message.content:
+        if part.get("type") == "text":
+            parts.append(str(part.get("text", "")))
+    return "\n".join(part for part in parts if part).strip()
+
+
+def _latest_user_text(messages: list[OpenAIMessage]) -> str:
+    for message in reversed(messages):
+        if message.role == "user":
+            text = _extract_message_text(message)
+            if text:
+                return text
+    return ""
+
+
+def _first_user_text(messages: list[OpenAIMessage]) -> str:
+    for message in messages:
+        if message.role == "user":
+            text = _extract_message_text(message)
+            if text:
+                return text
+    return ""
+
+
+def _compat_field(payload: OpenAIChatCompletionRequest, field_name: str) -> str | None:
+    direct_value = getattr(payload, field_name, None)
+    if direct_value is not None:
+        normalized = str(direct_value).strip()
+        if normalized:
+            return normalized
+
+    metadata = payload.metadata or {}
+    metadata_value = metadata.get(field_name)
+    if metadata_value is None:
+        return None
+    normalized = str(metadata_value).strip()
+    return normalized or None
+
+
+def _compat_user_role(payload: OpenAIChatCompletionRequest) -> str:
+    return _compat_field(payload, "user_role") or "unknown"
+
+
+def _compat_store_id(payload: OpenAIChatCompletionRequest) -> str | None:
+    return _compat_field(payload, "store_id")
+
+
+def _generate_thread_id() -> str:
+    return f"thread_{uuid.uuid4().hex[:16]}"
+
+
+def _compat_thread_id(payload: OpenAIChatCompletionRequest) -> str:
+    return _compat_field(payload, "thread_id") or _generate_thread_id()
+
+
+def _has_explicit_thread_id(payload: OpenAIChatCompletionRequest) -> bool:
+    return _compat_field(payload, "thread_id") is not None
+
+
+def _current_turn_messages(messages: list[OpenAIMessage]) -> list[OpenAIMessage]:
+    latest_user: OpenAIMessage | None = None
+    for message in reversed(messages):
+        if message.role == "user" and _extract_message_text(message):
+            latest_user = message
+            break
+
+    if latest_user is None:
+        return messages
+
+    current_messages = [message for message in messages if message.role == "system"]
+    current_messages.append(latest_user)
+    return current_messages
+
+
+def _requested_human_handoff(text: str) -> bool:
+    keywords = ("人工", "人工客服", "转人工", "真人", "客服")
+    normalized = text.strip()
+    return any(keyword in normalized for keyword in keywords)
+
+
+async def get_customer_service_supervisor():
+    from src.agent.customer_service import get_customer_service_supervisor as _getter
+
+    return await _getter()
+
+
+async def get_customer_service_store():
+    from src.memory.customer_service import get_customer_service_store as _getter
+
+    return _getter()
+
+
+async def _should_route_customer_service(
+    payload: OpenAIChatCompletionRequest,
+    thread_id: str,
+) -> bool:
+    if _compat_user_role(payload) == "customer":
+        return True
+
+    latest_user_text = _latest_user_text(payload.messages)
+    if _requested_human_handoff(latest_user_text):
+        return True
+
+    if not payload.user and not _has_explicit_thread_id(payload):
+        return False
+
+    store = await get_customer_service_store()
+    if await store.get_active_handoff(thread_id):
+        return True
+    return await store.is_customer_thread(thread_id, user_id=payload.user or "openai_compat")
+
+
 def _render_plan(plan: list[dict[str, str]]) -> str:
     if not plan:
         return ""
@@ -115,7 +244,7 @@ def _json_dumps(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
-def _build_chat_response(model: str, content: str) -> dict[str, Any]:
+def _build_chat_response(model: str, content: str, *, thread_id: str) -> dict[str, Any]:
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     return {
@@ -123,6 +252,7 @@ def _build_chat_response(model: str, content: str) -> dict[str, Any]:
         "object": "chat.completion",
         "created": created,
         "model": model,
+        "thread_id": thread_id,
         "choices": [
             {
                 "index": 0,
@@ -142,6 +272,7 @@ def _build_stream_chunk(
     *,
     completion_id: str,
     model: str,
+    thread_id: str,
     content: str = "",
     finish_reason: str | None = None,
     include_role: bool = False,
@@ -157,6 +288,7 @@ def _build_stream_chunk(
         "object": "chat.completion.chunk",
         "created": int(time.time()),
         "model": model,
+        "thread_id": thread_id,
         "choices": [
             {
                 "index": 0,
@@ -177,35 +309,90 @@ def _image_extension_from_mime(mime_type: str | None) -> str:
     return guessed or ".bin"
 
 
+def _is_private_host(hostname: str) -> bool:
+    """Check if hostname resolves to a private/loopback/reserved IP."""
+    import ipaddress
+    import socket
+
+    try:
+        addrs = socket.getaddrinfo(hostname, None)
+        for addr in addrs:
+            ip = ipaddress.ip_address(addr[4][0])
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+                return True
+        return False
+    except Exception:
+        return True  # Fail safe: block on resolution errors
+
+
 async def _materialize_image(url: str) -> dict[str, Any]:
     parsed = urlparse(url)
     if parsed.scheme not in SUPPORTED_IMAGE_SCHEMES:
         raise HTTPException(status_code=400, detail=f"暂不支持的图片协议: {parsed.scheme}")
 
-    image_dir = Path(settings.upload_dir) / "openai_compat"
-    image_dir.mkdir(parents=True, exist_ok=True)
     file_id = uuid.uuid4().hex
 
     if parsed.scheme == "data":
+        # Validate data URL format
+        if "," not in url:
+            raise HTTPException(status_code=400, detail="无效的 data URL 格式")
         header, encoded = url.split(",", maxsplit=1)
+        if ":" not in header or ";" not in header:
+            raise HTTPException(status_code=400, detail="无效的 data URL 格式")
         mime_type = header.split(":", 1)[1].split(";", 1)[0]
+        if not mime_type.startswith("image/"):
+            raise HTTPException(status_code=400, detail=f"不支持的图片格式: {mime_type}")
+        try:
+            image_data = base64.b64decode(encoded)
+        except Exception:
+            raise HTTPException(status_code=400, detail="无效的 base64 图片数据")
+        if len(image_data) > 20 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="图片数据过大（上限 20MB）")
         suffix = _image_extension_from_mime(mime_type)
-        file_path = image_dir / f"{file_id}{suffix}"
-        file_path.write_bytes(base64.b64decode(encoded))
     else:
+        # SSRF protection: block private/loopback addresses
+        hostname = parsed.hostname or ""
+        if not hostname or _is_private_host(hostname):
+            raise HTTPException(status_code=400, detail="不允许访问内网地址")
+
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(url)
             response.raise_for_status()
+
+        # Limit response size to 10MB
+        if len(response.content) > 10 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="图片过大（上限 10MB）")
+
         mime_type = response.headers.get("content-type", "").split(";", 1)[0]
         suffix = Path(parsed.path).suffix or _image_extension_from_mime(mime_type)
-        file_path = image_dir / f"{file_id}{suffix}"
-        file_path.write_bytes(response.content)
+        image_data = response.content
+
+    # 上传到 OSS
+    object_key = build_object_key("openai_compat", file_id, suffix)
+    try:
+        await anyio.to_thread.run_sync(lambda: oss_upload_bytes(object_key, image_data, mime_type))
+    except OSSStorageError as e:
+        logger.error("OpenAI 兼容层图片上传到 OSS 失败", error=str(e), object_key=object_key)
+        raise HTTPException(status_code=503, detail="文件存储服务暂时不可用，请稍后重试") from e
+
+    try:
+        local_path = await anyio.to_thread.run_sync(
+            lambda: materialize_attachment_from_oss(
+                object_key=object_key,
+                file_id=file_id,
+                user_id="openai_compat",
+                suffix=suffix,
+            )
+        )
+    except OSSStorageError as e:
+        logger.error("OpenAI 兼容层图片从 OSS 物化失败", error=str(e), object_key=object_key)
+        raise HTTPException(status_code=503, detail="文件存储服务暂时不可用，请稍后重试") from e
 
     return {
         "file_id": file_id,
-        "filename": file_path.name,
+        "filename": f"{file_id}{suffix}",
         "file_type": "image",
-        "file_path": str(file_path),
+        "file_path": local_path,
     }
 
 
@@ -246,15 +433,36 @@ async def _translate_messages(
     return prompt, attachments
 
 
+async def _translate_current_turn(
+    payload: OpenAIChatCompletionRequest,
+) -> tuple[str, list[dict[str, Any]]]:
+    return await _translate_messages(_current_turn_messages(payload.messages))
+
+
 async def _run_non_stream(payload: OpenAIChatCompletionRequest) -> dict[str, Any]:
-    prompt, attachments = await _translate_messages(payload.messages)
+    prompt, attachments = await _translate_current_turn(payload)
     user_id = payload.user or "openai_compat"
-    thread_id = f"oa_{uuid.uuid4().hex[:16]}"
+    thread_id = _compat_thread_id(payload)
+    user_role = _compat_user_role(payload)
+    store_id = _compat_store_id(payload)
+    latest_user_text = _latest_user_text(_current_turn_messages(payload.messages)) or prompt
+
+    if await _should_route_customer_service(payload, thread_id):
+        supervisor = await get_customer_service_supervisor()
+        result = await supervisor.invoke(
+            message=latest_user_text,
+            thread_id=thread_id,
+            user_id=user_id,
+            channel="web",
+            store_id=store_id,
+        )
+        return _build_chat_response(payload.model, result.content, thread_id=thread_id)
 
     mode = await _resolve_mode(
         requested_mode=SUPPORTED_MODELS[payload.model],
         prompt=prompt,
         attachments=attachments,
+        user_role=user_role,
     )
     if mode == "plan":
         from src.agent.plan_runner import get_plan_runner
@@ -264,12 +472,24 @@ async def _run_non_stream(payload: OpenAIChatCompletionRequest) -> dict[str, Any
             message=prompt,
             thread_id=thread_id,
             user_id=user_id,
-            user_role="unknown",
+            user_role=user_role,
             channel="web",
+            store_id=store_id,
             attachments=attachments,
         )
         content = _build_plan_content(result.plan, result.content)
-        return _build_chat_response(payload.model, content)
+        from src.memory.conversations import record_conversation_turn
+
+        await record_conversation_turn(
+            thread_id=thread_id,
+            user_id=user_id,
+            user_role=user_role,
+            message=latest_user_text,
+            assistant_message=content,
+            channel="web",
+            store_id=store_id,
+        )
+        return _build_chat_response(payload.model, content, thread_id=thread_id)
 
     from src.agent.orchestrator import get_orchestrator
 
@@ -278,28 +498,47 @@ async def _run_non_stream(payload: OpenAIChatCompletionRequest) -> dict[str, Any
         message=prompt,
         thread_id=thread_id,
         user_id=user_id,
-        user_role="unknown",
+        user_role=user_role,
         channel="web",
+        store_id=store_id,
         attachments=attachments,
     )
-    return _build_chat_response(payload.model, content)
+    from src.memory.conversations import record_conversation_turn
+
+    await record_conversation_turn(
+        thread_id=thread_id,
+        user_id=user_id,
+        user_role=user_role,
+        message=latest_user_text,
+        assistant_message=content,
+        channel="web",
+        store_id=store_id,
+    )
+    return _build_chat_response(payload.model, content, thread_id=thread_id)
 
 
 async def _stream_plan_events(
     payload: OpenAIChatCompletionRequest,
     prompt: str,
     attachments: list[dict[str, Any]],
+    *,
+    thread_id: str,
 ):
     from src.agent.plan_runner import get_plan_runner
+    from src.memory.conversations import record_conversation_turn
 
     runner = await get_plan_runner()
-    thread_id = f"oa_{uuid.uuid4().hex[:16]}"
+    user_role = _compat_user_role(payload)
+    store_id = _compat_store_id(payload)
+    latest_user_text = _latest_user_text(_current_turn_messages(payload.messages)) or prompt
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     rendered_plan: str | None = None
+    final_tokens: list[str] = []
 
     yield _build_stream_chunk(
         completion_id=completion_id,
         model=payload.model,
+        thread_id=thread_id,
         include_role=True,
     )
 
@@ -308,8 +547,9 @@ async def _stream_plan_events(
             message=prompt,
             thread_id=thread_id,
             user_id=payload.user or "openai_compat",
-            user_role="unknown",
+            user_role=user_role,
             channel="web",
+            store_id=store_id,
             attachments=attachments,
         ):
             event_type = event.get("type")
@@ -320,13 +560,16 @@ async def _stream_plan_events(
                     yield _build_stream_chunk(
                         completion_id=completion_id,
                         model=payload.model,
+                        thread_id=thread_id,
                         content=f"{new_plan}\n\n## 执行结果\n",
                     )
                 continue
             if event_type == "token":
+                final_tokens.append(str(event.get("content", "")))
                 yield _build_stream_chunk(
                     completion_id=completion_id,
                     model=payload.model,
+                    thread_id=thread_id,
                     content=str(event.get("content", "")),
                 )
                 continue
@@ -338,19 +581,37 @@ async def _stream_plan_events(
             message=prompt,
             thread_id=thread_id,
             user_id=payload.user or "openai_compat",
-            user_role="unknown",
+            user_role=user_role,
             channel="web",
+            store_id=store_id,
             attachments=attachments,
         )
         yield _build_stream_chunk(
             completion_id=completion_id,
             model=payload.model,
+            thread_id=thread_id,
             content=_build_plan_content(result.plan, result.content),
         )
+        rendered_plan = _render_plan(result.plan)
+        final_tokens = [result.content]
 
+    await record_conversation_turn(
+        thread_id=thread_id,
+        user_id=payload.user or "openai_compat",
+        user_role=user_role,
+        message=latest_user_text,
+        assistant_message=(
+            f"{rendered_plan}\n\n## 执行结果\n{''.join(final_tokens)}"
+            if rendered_plan
+            else "".join(final_tokens)
+        ),
+        channel="web",
+        store_id=store_id,
+    )
     yield _build_stream_chunk(
         completion_id=completion_id,
         model=payload.model,
+        thread_id=thread_id,
         finish_reason="stop",
     )
     yield "data: [DONE]\n\n"
@@ -361,15 +622,56 @@ async def _stream_chat_events(
     prompt: str,
     attachments: list[dict[str, Any]],
 ):
+    from src.memory.conversations import record_conversation_turn
+
+    thread_id = _compat_thread_id(payload)
+    user_role = _compat_user_role(payload)
+    store_id = _compat_store_id(payload)
+    latest_user_text = _latest_user_text(_current_turn_messages(payload.messages)) or prompt
+    if await _should_route_customer_service(payload, thread_id):
+        supervisor = await get_customer_service_supervisor()
+        completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+
+        yield _build_stream_chunk(
+            completion_id=completion_id,
+            model=payload.model,
+            thread_id=thread_id,
+            include_role=True,
+        )
+
+        async for token in supervisor.stream(
+            message=latest_user_text,
+            thread_id=thread_id,
+            user_id=payload.user or "openai_compat",
+            channel="web",
+            store_id=store_id,
+        ):
+            yield _build_stream_chunk(
+                completion_id=completion_id,
+                model=payload.model,
+                thread_id=thread_id,
+                content=str(token),
+            )
+
+        yield _build_stream_chunk(
+            completion_id=completion_id,
+            model=payload.model,
+            thread_id=thread_id,
+            finish_reason="stop",
+        )
+        yield "data: [DONE]\n\n"
+        return
+
     from src.agent.orchestrator import get_orchestrator
 
     orchestrator = await get_orchestrator()
-    thread_id = f"oa_{uuid.uuid4().hex[:16]}"
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+    final_tokens: list[str] = []
 
     yield _build_stream_chunk(
         completion_id=completion_id,
         model=payload.model,
+        thread_id=thread_id,
         include_role=True,
     )
 
@@ -377,19 +679,32 @@ async def _stream_chat_events(
         message=prompt,
         thread_id=thread_id,
         user_id=payload.user or "openai_compat",
-        user_role="unknown",
+        user_role=user_role,
         channel="web",
+        store_id=store_id,
         attachments=attachments,
     ):
+        final_tokens.append(str(token))
         yield _build_stream_chunk(
             completion_id=completion_id,
             model=payload.model,
+            thread_id=thread_id,
             content=str(token),
         )
 
+    await record_conversation_turn(
+        thread_id=thread_id,
+        user_id=payload.user or "openai_compat",
+        user_role=user_role,
+        message=latest_user_text,
+        assistant_message="".join(final_tokens),
+        channel="web",
+        store_id=store_id,
+    )
     yield _build_stream_chunk(
         completion_id=completion_id,
         model=payload.model,
+        thread_id=thread_id,
         finish_reason="stop",
     )
     yield "data: [DONE]\n\n"
@@ -400,6 +715,7 @@ async def _resolve_mode(
     requested_mode: Literal["auto", "chat", "plan"],
     prompt: str,
     attachments: list[dict[str, Any]],
+    user_role: str,
 ) -> Literal["chat", "plan"]:
     if requested_mode in {"chat", "plan"}:
         return requested_mode
@@ -411,7 +727,7 @@ async def _resolve_mode(
         message=prompt,
         requested_mode="auto",
         attachments=attachments,
-        user_role="unknown",
+        user_role=user_role,
         channel="web",
     )
     return str(decision["resolved_mode"])
@@ -445,14 +761,20 @@ async def create_chat_completion(payload: OpenAIChatCompletionRequest):
     if not payload.stream:
         return await _run_non_stream(payload)
 
-    prompt, attachments = await _translate_messages(payload.messages)
+    prompt, attachments = await _translate_current_turn(payload)
+    thread_id = _compat_thread_id(payload)
+    if await _should_route_customer_service(payload, thread_id):
+        generator = _stream_chat_events(payload, prompt, attachments)
+        return StreamingResponse(generator, media_type="text/event-stream")
+
     mode = await _resolve_mode(
         requested_mode=SUPPORTED_MODELS[payload.model],
         prompt=prompt,
         attachments=attachments,
+        user_role=_compat_user_role(payload),
     )
     if mode == "plan":
-        generator = _stream_plan_events(payload, prompt, attachments)
+        generator = _stream_plan_events(payload, prompt, attachments, thread_id=thread_id)
     else:
         generator = _stream_chat_events(payload, prompt, attachments)
 

@@ -2,26 +2,33 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import structlog
 from deepagents import create_deep_agent
-from langchain_core.tools import tool
+from deepagents.backends.filesystem import FilesystemBackend
+from langchain_core.tools import tool  # still used for analyze_uploaded_attachments @tool
 
 from src.agent.orchestrator import build_system_prompt, create_llm
 from src.config import settings
 from src.subagents.attachment_analysis import AttachmentAnalysisAgent
-from src.subagents.content_generation import ContentGenerationAgent
-from src.subagents.data_analysis import DataAnalysisAgent
-from src.subagents.knowledge_base import KBAgent
+from src.subagents.content_generation import CONTENT_SUBAGENT
+from src.subagents.data_analysis import DATA_ANALYSIS_SUBAGENT
+from src.subagents.knowledge_base import KB_SUBAGENT
 from src.tools.openclaw_tools import OpenClawToolkit
 
 if TYPE_CHECKING:
     from langgraph.checkpoint.base import BaseCheckpointSaver
 
 logger = structlog.get_logger(__name__)
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEEPAGENTS_BACKEND_ROOT = PROJECT_ROOT / "src"
+DEEPAGENTS_SKILL_SOURCES = ["/skills"]
 
 PLAN_SYSTEM_PROMPT = """你现在运行在 plan 模式。
 
@@ -34,11 +41,15 @@ PLAN_SYSTEM_PROMPT = """你现在运行在 plan 模式。
 """
 
 TABULAR_FILE_TYPES = {"csv", "excel"}
+# Display names for remaining @tool calls (non-subagent)
 TOOL_DISPLAY_NAMES = {
-    "research_private_domain_knowledge": "检索知识库",
-    "generate_operational_content": "生成运营内容",
     "analyze_uploaded_attachments": "分析附件",
-    "analyze_uploaded_data": "分析表格数据",
+}
+# Display names for subagent dispatches via the built-in `task` tool
+SUBAGENT_DISPLAY_NAMES = {
+    "knowledge-base": "检索知识库",
+    "content-generation": "生成运营内容",
+    "data-analysis": "分析表格数据",
 }
 
 
@@ -69,6 +80,7 @@ class DeepPlanRunner:
         user_id: str,
         user_role: str = "unknown",
         channel: str = "web",
+        store_id: str | None = None,
         attachments: list[dict] | None = None,
     ) -> PlanRunResult:
         attachments = attachments or []
@@ -76,6 +88,7 @@ class DeepPlanRunner:
             user_id=user_id,
             user_role=user_role,
             channel=channel,
+            store_id=store_id,
             attachments=attachments,
         )
         result = await agent.ainvoke(
@@ -105,6 +118,7 @@ class DeepPlanRunner:
         user_id: str,
         user_role: str = "unknown",
         channel: str = "web",
+        store_id: str | None = None,
         attachments: list[dict] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         attachments = attachments or []
@@ -112,6 +126,7 @@ class DeepPlanRunner:
             user_id=user_id,
             user_role=user_role,
             channel=channel,
+            store_id=store_id,
             attachments=attachments,
         )
 
@@ -170,14 +185,15 @@ class DeepPlanRunner:
                 continue
 
             if kind == "on_tool_start" and name != "write_todos":
+                tool_input = data.get("input") or {}
                 yield {
                     "type": "tool",
                     "content": {
                         "task_id": self._current_task_id(latest_plan),
                         "tool_name": name,
-                        "display_name": TOOL_DISPLAY_NAMES.get(name, "执行外部动作"),
+                        "display_name": self._resolve_display_name(name, tool_input),
                         "status": "started",
-                        "summary": self._build_tool_summary(name, data.get("input"), started=True),
+                        "summary": self._build_tool_summary(name, tool_input, started=True),
                         "duration_ms": None,
                     },
                     "thread_id": thread_id,
@@ -190,7 +206,7 @@ class DeepPlanRunner:
                     "content": {
                         "task_id": self._current_task_id(latest_plan),
                         "tool_name": name,
-                        "display_name": TOOL_DISPLAY_NAMES.get(name, "执行外部动作"),
+                        "display_name": self._resolve_display_name(name, data.get("input") or {}),
                         "status": "completed",
                         "summary": self._build_tool_summary(name, data.get("output")),
                         "duration_ms": None,
@@ -205,7 +221,7 @@ class DeepPlanRunner:
                     "content": {
                         "task_id": self._current_task_id(latest_plan),
                         "tool_name": name,
-                        "display_name": TOOL_DISPLAY_NAMES.get(name, "执行外部动作"),
+                        "display_name": self._resolve_display_name(name, data.get("input") or {}),
                         "status": "failed",
                         "summary": self._truncate_summary(data.get("error") or "工具执行失败"),
                         "duration_ms": None,
@@ -243,18 +259,27 @@ class DeepPlanRunner:
         user_id: str,
         user_role: str,
         channel: str,
+        store_id: str | None = None,
         attachments: list[dict],
     ):
         tools = self._build_tools(
             user_id=user_id,
             user_role=user_role,
             channel=channel,
+            store_id=store_id,
             attachments=attachments,
         )
         attachment_context = ""
         if attachments:
-            filenames = ", ".join(a.get("filename", "未知文件") for a in attachments)
-            attachment_context = f"\n当前可用附件：{filenames}"
+            attachment_lines = [
+                f"  - {a.get('filename', '未知文件')} "
+                f"[类型:{a.get('file_type', '?')}] 路径:{a.get('file_path', '')}"
+                for a in attachments
+            ]
+            attachment_context = (
+                "\n当前可用附件（已上传，直接用路径传给子智能体分析）：\n"
+                + "\n".join(attachment_lines)
+            )
 
         system_prompt = (
             build_system_prompt(user_role)
@@ -266,7 +291,14 @@ class DeepPlanRunner:
         return create_deep_agent(
             model=self.llm,
             tools=tools,
+            subagents=[KB_SUBAGENT, CONTENT_SUBAGENT, DATA_ANALYSIS_SUBAGENT],
             system_prompt=system_prompt,
+            skills=DEEPAGENTS_SKILL_SOURCES,
+            # Scope filesystem access to `src/` only and enable virtual path guardrails.
+            backend=FilesystemBackend(
+                root_dir=DEEPAGENTS_BACKEND_ROOT,
+                virtual_mode=True,
+            ),
             checkpointer=self.checkpointer,
             name="private-domain-plan-runner",
         )
@@ -277,51 +309,23 @@ class DeepPlanRunner:
         user_id: str,
         user_role: str,
         channel: str,
+        store_id: str | None = None,
         attachments: list[dict],
     ) -> list[Any]:
-        @tool
-        async def research_private_domain_knowledge(question: str) -> str:
-            """检索私域运营知识并返回带引用的专业答案。"""
-            agent = KBAgent(llm=self.llm)
-            return await agent.query(question, user_role=user_role)
-
-        @tool
-        async def generate_operational_content(requirement: str) -> str:
-            """生成私域运营内容，例如活动方案、话术、SOP、海报文案。"""
-            agent = ContentGenerationAgent(llm=self.llm)
-            return await agent.generate(requirement, user_role=user_role, channel=channel)
+        # KB, content-generation, and data-analysis are registered as subagents via
+        # subagents= in create_deep_agent and dispatched through the built-in `task` tool.
+        # AttachmentAnalysisAgent stays as a @tool because it requires dual-LLM routing
+        # (text + vision) which does not map to a single SubAgent model field.
 
         @tool
         async def analyze_uploaded_attachments(question: str) -> str:
-            """分析当前已上传的图片、文档或混合附件。"""
+            """分析当前已上传的图片、文档或混合附件（支持图片、PDF、Word）。"""
             if not attachments:
                 return "当前没有可分析的附件。"
             agent = AttachmentAnalysisAgent(text_llm=self.llm, vision_llm=self.vision_llm)
             return await agent.analyze(question, attachments=attachments, user_role=user_role)
 
-        @tool
-        async def analyze_uploaded_data(question: str) -> str:
-            """分析当前已上传的表格数据（CSV/Excel）。"""
-            tabular_attachments = [
-                attachment
-                for attachment in attachments
-                if attachment.get("file_type") in TABULAR_FILE_TYPES
-            ]
-            if not tabular_attachments:
-                return "当前没有可分析的表格附件。"
-            agent = DataAnalysisAgent(llm=self.llm)
-            return await agent.analyze(
-                question,
-                attachments=tabular_attachments,
-                user_role=user_role,
-            )
-
-        tools: list[Any] = [
-            research_private_domain_knowledge,
-            generate_operational_content,
-            analyze_uploaded_attachments,
-            analyze_uploaded_data,
-        ]
+        tools: list[Any] = [analyze_uploaded_attachments]
         tools.extend(OpenClawToolkit().get_tools())
         return tools
 
@@ -372,6 +376,13 @@ class DeepPlanRunner:
             return plan[0].get("task_id")
         return None
 
+    def _resolve_display_name(self, tool_name: str, tool_input: dict) -> str:
+        """Resolve a human-readable display name for a tool or subagent dispatch."""
+        if tool_name == "task":
+            subagent_name = tool_input.get("agent_name", "")
+            return SUBAGENT_DISPLAY_NAMES.get(subagent_name, "调用子智能体")
+        return TOOL_DISPLAY_NAMES.get(tool_name, "执行外部动作")
+
     def _build_tool_summary(
         self,
         tool_name: str,
@@ -379,7 +390,11 @@ class DeepPlanRunner:
         *,
         started: bool = False,
     ) -> str:
-        display_name = TOOL_DISPLAY_NAMES.get(tool_name, "外部动作")
+        if tool_name == "task" and isinstance(payload, dict):
+            subagent_name = payload.get("agent_name", "")
+            display_name = SUBAGENT_DISPLAY_NAMES.get(subagent_name, "子智能体")
+        else:
+            display_name = TOOL_DISPLAY_NAMES.get(tool_name, "外部动作")
         if started:
             return f"开始{display_name}"
         if payload is None:
@@ -394,14 +409,18 @@ class DeepPlanRunner:
 
 
 _plan_runner: DeepPlanRunner | None = None
+_plan_runner_lock = asyncio.Lock()
 
 
 async def get_plan_runner() -> DeepPlanRunner:
     global _plan_runner
-    if _plan_runner is None:
-        from src.memory.checkpointer import get_checkpointer
+    if _plan_runner is not None:
+        return _plan_runner
+    async with _plan_runner_lock:
+        if _plan_runner is None:
+            from src.memory.checkpointer import get_checkpointer
 
-        checkpointer = await get_checkpointer()
-        _plan_runner = DeepPlanRunner(checkpointer=checkpointer)
-        logger.info("Deep plan runner 初始化完成")
+            checkpointer = await get_checkpointer()
+            _plan_runner = DeepPlanRunner(checkpointer=checkpointer)
+            logger.info("Deep plan runner 初始化完成")
     return _plan_runner

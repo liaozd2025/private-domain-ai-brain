@@ -7,6 +7,8 @@
   - 输出分析报告
 """
 
+import base64
+import importlib
 import os
 import textwrap
 import traceback
@@ -14,17 +16,16 @@ from functools import lru_cache
 from pathlib import Path
 
 import structlog
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage
 from langchain_core.tools import tool
 
 from src.agent.runtime import ModernToolAgent
+from src.config import settings
+from src.skills.runtime import build_skill_bundle
 from src.tools.file_tools import get_dataframe_info, read_uploaded_file
 
 logger = structlog.get_logger(__name__)
 
-AgentExecutor = None
-create_tool_calling_agent = None
-SKILL_DIR = Path(__file__).resolve().parent.parent / "skills" / "data-analysis"
 STORE_DIAGNOSIS_KEYWORDS = (
     "门店诊断",
     "五大指标",
@@ -56,17 +57,35 @@ ALLOWED_IMPORTS = {
 
 
 def _is_safe_code(code: str) -> tuple[bool, str]:
-    """简单的代码安全检查"""
-    dangerous_keywords = [
-        "import os", "import sys", "import subprocess",
-        "exec(", "eval(", "__import__",
-        "open(", "file(", "input(",
-        "socket", "urllib", "requests", "httpx",
-        "shutil", "pathlib.Path(",
-    ]
-    for kw in dangerous_keywords:
-        if kw in code:
-            return False, f"不允许使用 '{kw}'"
+    """AST-based code security check"""
+    import ast as _ast
+
+    try:
+        tree = _ast.parse(code)
+    except SyntaxError as e:
+        return False, f"语法错误: {e}"
+
+    for node in _ast.walk(tree):
+        # Reject any import not in the whitelist
+        if isinstance(node, _ast.Import):
+            for alias in node.names:
+                module = alias.name.split(".")[0]
+                if module not in ALLOWED_IMPORTS:
+                    return False, f"不允许导入模块: {alias.name}"
+        elif isinstance(node, _ast.ImportFrom):
+            module = (node.module or "").split(".")[0]
+            if module not in ALLOWED_IMPORTS:
+                return False, f"不允许导入模块: {node.module}"
+        # Reject dunder attribute access (__class__, __globals__, etc.)
+        elif isinstance(node, _ast.Attribute):
+            if node.attr.startswith("__") and node.attr.endswith("__"):
+                return False, f"不允许访问特殊属性: {node.attr}"
+        # Reject dangerous builtin calls
+        elif isinstance(node, _ast.Call):
+            if isinstance(node.func, _ast.Name):
+                if node.func.id in {"exec", "eval", "compile", "__import__", "open", "input"}:
+                    return False, f"不允许调用: {node.func.id}"
+
     return True, ""
 
 
@@ -96,8 +115,65 @@ def run_python_analysis(code: str, file_path: str | None = None) -> str:
 
     matplotlib.use("Agg")  # 非交互式后端
 
+    import types as _types
+    from pathlib import Path as _Path
+
+    _upload_dir = str(_Path(settings.upload_dir).resolve())
+
+    def _safe_read_csv(path, *args, **kwargs):
+        resolved = str(_Path(str(path)).resolve())
+        if not resolved.startswith(_upload_dir):
+            raise PermissionError(f"不允许读取路径: {path}")
+        return pd.read_csv(resolved, *args, **kwargs)
+
+    def _safe_read_excel(path, *args, **kwargs):
+        resolved = str(_Path(str(path)).resolve())
+        if not resolved.startswith(_upload_dir):
+            raise PermissionError(f"不允许读取路径: {path}")
+        return pd.read_excel(resolved, *args, **kwargs)
+
+    _safe_pd = _types.ModuleType("pandas")
+    _safe_pd.__dict__.update(vars(pd))
+    _safe_pd.read_csv = _safe_read_csv
+    _safe_pd.read_excel = _safe_read_excel
+
+    def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if level != 0:
+            raise ImportError("不允许相对导入")
+
+        module_name = str(name)
+        top_level = module_name.split(".")[0]
+        if module_name not in ALLOWED_IMPORTS and top_level not in ALLOWED_IMPORTS:
+            raise ImportError(f"不允许导入模块: {module_name}")
+
+        if module_name == "pandas":
+            return _safe_pd
+        if module_name == "numpy":
+            return np
+        if module_name == "matplotlib.pyplot":
+            return plt
+        if module_name == "matplotlib":
+            safe_matplotlib = _types.ModuleType("matplotlib")
+            safe_matplotlib.__dict__.update(vars(matplotlib))
+            safe_matplotlib.pyplot = plt
+            return safe_matplotlib
+
+        imported = importlib.import_module(module_name)
+        if module_name.startswith("plotly"):
+            return imported
+        if module_name.startswith("scipy"):
+            return imported
+
+        if top_level == "matplotlib":
+            safe_matplotlib = _types.ModuleType("matplotlib")
+            safe_matplotlib.__dict__.update(vars(matplotlib))
+            safe_matplotlib.pyplot = plt
+            return safe_matplotlib
+
+        return imported
+
     sandbox_globals = {
-        "pd": pd,
+        "pd": _safe_pd,
         "np": np,
         "plt": plt,
         "__builtins__": {
@@ -118,6 +194,7 @@ def run_python_analysis(code: str, file_path: str | None = None) -> str:
             "min": min,
             "sorted": sorted,
             "abs": abs,
+            "__import__": _safe_import,
         },
     }
 
@@ -241,7 +318,10 @@ BASE_DA_AGENT_SYSTEM_PROMPT = (
     "5. **输出报告**：给出清晰的分析结论和建议\n\n"
     "## 分析代码规范\n\n"
     "通过 run_python_analysis 工具传入 Python 代码，数据文件通过 file_path 参数指定。\n"
-    "代码中使用 df 变量访问数据，分析结果赋值给 result 变量（字符串格式）。\n\n"
+    "代码中使用 df 变量访问数据，分析结果赋值给 result 变量（字符串格式）。\n"
+    "运行环境已预置 pd / np / plt，不要重复 import pandas、numpy、matplotlib。\n"
+    "不要在代码里硬编码 pd.read_excel('/app/uploads/...') 或 pd.read_csv('/app/uploads/...')，"
+    "应把文件路径通过 run_python_analysis 的 file_path 参数传入，由工具自动加载 df。\n\n"
     "示例：store_sales = df.groupby('门店名称')['销售额'].sum().sort_values(ascending=False)\n"
     "result = '门店分析: ' + store_sales.to_string()\n\n"
     "## 输出规范\n\n"
@@ -276,19 +356,17 @@ def is_store_diagnosis_request(query: str = "", attachments: list[dict] | None =
     return False
 
 
-def _read_skill_file(relative_path: str) -> str:
-    path = SKILL_DIR / relative_path
-    return path.read_text(encoding="utf-8")
-
-
 @lru_cache(maxsize=1)
 def _load_store_diagnosis_skill_bundle() -> str:
-    sections = [
-        "# Skill\n" + _read_skill_file("SKILL.md"),
-        "# Rules\n" + _read_skill_file("references/store-diagnosis-rules.md"),
-        "# Cases\n" + _read_skill_file("references/store-diagnosis-cases.md"),
-    ]
-    return "\n\n".join(sections)
+    return build_skill_bundle(
+        ("data-analysis",),
+        extra_files=(
+            ("data-analysis", (
+                "references/store-diagnosis-rules.md",
+                "references/store-diagnosis-cases.md",
+            )),
+        ),
+    )
 
 
 def build_data_analysis_system_prompt(
@@ -326,32 +404,59 @@ def build_data_analysis_system_prompt(
     )
 
 
+# Official Deep Agents SubAgent spec — use with create_deep_agent(subagents=[...]).
+# Skill 动态加载由 Deep Agents 引擎通过 skills=["/skills/data-analysis"] 自动处理，
+# 不再在 system_prompt 里手工拼接 SKILL.md + references 内容。
+DATA_ANALYSIS_SUBAGENT: dict = {
+    "name": "data-analysis",
+    "description": (
+        "Use to analyze uploaded CSV or Excel data files. "
+        "Supports general data analysis, trend analysis, chart generation, "
+        "and 美容门店五大指标 (beauty store five-key-metric) performance diagnosis. "
+        "Include the file paths and analysis goal in the task description."
+    ),
+    "tools": DA_AGENT_TOOLS,
+    "system_prompt": BASE_DA_AGENT_SYSTEM_PROMPT,
+    "skills": ["/skills/data-analysis"],
+}
+
+
+_IMAGE_MIME = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp"}
+
+
 class DataAnalysisAgent:
     """数据分析子智能体"""
 
-    def __init__(self, llm):
+    def __init__(self, llm, vision_llm=None):
         self.llm = llm
+        self.vision_llm = vision_llm
         self._agent = self._create_agent()
 
+    async def _extract_image_data(self, attachment: dict) -> str:
+        """用 vision LLM 提取图片中的数据文本，供后续分析使用"""
+        file_path = attachment.get("file_path", "")
+        if not file_path or not Path(file_path).exists():
+            return "（图片文件不存在）"
+        suffix = Path(file_path).suffix.lower().lstrip(".")
+        mime = _IMAGE_MIME.get(suffix, "image/png")
+        with open(file_path, "rb") as f:
+            encoded = base64.b64encode(f.read()).decode()
+        msg = HumanMessage(
+            content=[
+                {
+                    "type": "text",
+                    "text": (
+                        "请识别图片中所有数据、表格、指标数值，"
+                        "以结构化文本格式输出，便于后续数据分析使用。"
+                    ),
+                },
+                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}},
+            ]
+        )
+        resp = await self.vision_llm.ainvoke([msg])
+        return resp.content
+
     def _create_agent(self, system_prompt: str = BASE_DA_AGENT_SYSTEM_PROMPT):
-        if AgentExecutor is not None and create_tool_calling_agent is not None:
-            from langchain_core.prompts import ChatPromptTemplate
-
-            prompt = ChatPromptTemplate.from_messages([
-                ("system", system_prompt),
-                ("human", "{input}"),
-                ("placeholder", "{agent_scratchpad}"),
-            ])
-
-            agent = create_tool_calling_agent(self.llm, DA_AGENT_TOOLS, prompt)
-            return AgentExecutor(
-                agent=agent,
-                tools=DA_AGENT_TOOLS,
-                verbose=False,
-                max_iterations=8,
-                handle_parsing_errors=True,
-            )
-
         return ModernToolAgent(
             self.llm,
             DA_AGENT_TOOLS,
@@ -376,70 +481,56 @@ class DataAnalysisAgent:
         Returns:
             分析报告
         """
-        # 构建包含文件路径的请求
-        enriched_query = query
-        if attachments:
-            file_info = "\n".join([
-                f"- {a.get('filename', '未知文件')}: {a.get('file_path', '')}"
-                for a in attachments
-            ])
-            enriched_query = f"[可用数据文件]:\n{file_info}\n\n[分析请求]: {query}"
-
-        if user_role != "unknown":
-            enriched_query = f"[用户角色: {user_role}]\n{enriched_query}"
-
         try:
+            # 图片附件 → 先用 vision LLM 提取数据文本
+            image_descriptions = []
+            if attachments and self.vision_llm:
+                for att in attachments:
+                    if att.get("file_type") == "image":
+                        logger.info("提取图片数据", filename=att.get("filename", ""))
+                        try:
+                            desc = await self._extract_image_data(att)
+                            image_descriptions.append(
+                                f"[图片数据 - {att.get('filename', '')}]:\n{desc}"
+                            )
+                        except Exception as img_err:
+                            logger.warning(
+                                "图片数据提取失败，跳过视觉分析",
+                                filename=att.get("filename", ""),
+                                error=str(img_err),
+                                exc_info=True,
+                            )
+                            image_descriptions.append(
+                                f"[图片 {att.get('filename', '')} 无法识别，请直接描述图中数据]"
+                            )
+
+            # 构建包含文件路径的请求（表格文件）
+            enriched_query = query
+            tabular_attachments = [a for a in (attachments or []) if a.get("file_type") != "image"]
+            if tabular_attachments:
+                file_info = "\n".join([
+                    f"- {a.get('filename', '未知文件')}: {a.get('file_path', '')}"
+                    for a in tabular_attachments
+                ])
+                enriched_query = f"[可用数据文件]:\n{file_info}\n\n[分析请求]: {query}"
+
+            if image_descriptions:
+                enriched_query = (
+                    "\n\n".join(image_descriptions) + f"\n\n[分析请求]: {enriched_query}"
+                )
+
+            if user_role != "unknown":
+                enriched_query = f"[用户角色: {user_role}]\n{enriched_query}"
+
             system_prompt = build_data_analysis_system_prompt(query, attachments)
             agent = self._agent
             if system_prompt != BASE_DA_AGENT_SYSTEM_PROMPT:
                 agent = self._create_agent(system_prompt)
 
-            if isinstance(agent, _FallbackDataAnalysisAgent):
-                result = await agent.ainvoke(
-                    {
-                        "input": enriched_query,
-                        "attachments": attachments or [],
-                        "query": query,
-                        "user_role": user_role,
-                    }
-                )
-            else:
-                result = await agent.ainvoke({"input": enriched_query})
+            result = await agent.ainvoke({"input": enriched_query})
             report = result.get("output", "分析失败，请重试。")
             logger.info("数据分析完成", query=query[:50], report_length=len(report))
             return report
         except Exception as e:
-            logger.error("数据分析失败", error=str(e))
+            logger.error("数据分析失败", error=str(e), exc_info=True)
             return f"数据分析遇到问题: {str(e)}"
-
-
-class _FallbackDataAnalysisAgent:
-    """在缺少 legacy agent API 时的最小可用实现"""
-
-    def __init__(self, llm, system_prompt: str = BASE_DA_AGENT_SYSTEM_PROMPT):
-        self.llm = llm
-        self.system_prompt = system_prompt
-
-    async def ainvoke(self, payload: dict) -> dict:
-        attachments = payload.get("attachments", [])
-        context_sections = []
-
-        for attachment in attachments:
-            file_path = attachment.get("file_path", "")
-            filename = attachment.get("filename", "未知文件")
-            summary = read_uploaded_file.invoke({"file_path": file_path})
-            details = get_dataframe_info.invoke({"file_path": file_path})
-            context_sections.append(f"[文件: {filename}]\n{summary}\n\n{details}")
-
-        response = await self.llm.ainvoke(
-            [
-                SystemMessage(content=self.system_prompt),
-                HumanMessage(
-                    content=(
-                        f"{payload.get('input', '')}\n\n"
-                        f"[文件内容概览]\n{chr(10).join(context_sections)}"
-                    )
-                ),
-            ]
-        )
-        return {"output": getattr(response, "content", str(response))}

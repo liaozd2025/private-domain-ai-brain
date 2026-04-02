@@ -1,39 +1,49 @@
 services:
   api:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     ports:
       - "8000:8000"
     env_file:
       - .env
     environment:
-      - POSTGRES_HOST=postgres
-      - MILVUS_HOST=milvus
+      POSTGRES_HOST: postgres
+      MILVUS_HOST: milvus
+      APP_ENV: ${APP_ENV:-production}
+      UPLOAD_DIR: /app/uploads
     volumes:
-      - ./uploads:/app/uploads
-      - ./src:/app/src  # 开发模式热重载
+      - ${APP_DATA_ROOT:-/data/private-domain-ai-brain}/uploads:/app/uploads
     depends_on:
       postgres:
         condition: service_healthy
       milvus:
-        condition: service_started
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 30s
     restart: unless-stopped
 
   postgres:
     image: postgres:16-alpine
-    environment:
-      POSTGRES_DB: ai_brain
-      POSTGRES_USER: ai_brain
-      POSTGRES_PASSWORD: changeme
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init.sql
     ports:
-      - "${POSTGRES_PORT:-5433}:5432"
+      - "${POSTGRES_HOST_PORT:-5431}:5432"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-ai_brain}
+      POSTGRES_USER: ${POSTGRES_USER:-ai_brain}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - ${APP_DATA_ROOT:-/data/private-domain-ai-brain}/postgres:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ai_brain"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ai_brain} -d ${POSTGRES_DB:-ai_brain}"]
       interval: 5s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
 
   etcd:
     image: quay.io/coreos/etcd:v3.5.5
@@ -43,22 +53,24 @@ services:
       - ETCD_QUOTA_BACKEND_BYTES=4294967296
       - ETCD_SNAPSHOT_COUNT=50000
     volumes:
-      - etcd_data:/etcd
-    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+      - ${APP_DATA_ROOT:-/data/private-domain-ai-brain}/etcd:/etcd
+    command: etcd -advertise-client-urls=http://etcd:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    restart: unless-stopped
 
   minio:
-    image: minio/minio:RELEASE.2023-03-13T19-46-17Z
+    image: minio/minio:RELEASE.2024-11-07T00-52-20Z
     environment:
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:?set MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:?set MINIO_SECRET_KEY}
     volumes:
-      - minio_data:/minio_data
+      - ${APP_DATA_ROOT:-/data/private-domain-ai-brain}/minio:/minio_data
     command: minio server /minio_data --console-address ":9001"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 30s
       timeout: 20s
       retries: 3
+    restart: unless-stopped
 
   milvus:
     image: milvusdb/milvus:v2.4.0
@@ -68,17 +80,19 @@ services:
     environment:
       ETCD_ENDPOINTS: etcd:2379
       MINIO_ADDRESS: minio:9000
+      MINIO_ACCESS_KEY_ID: ${MINIO_ACCESS_KEY:?set MINIO_ACCESS_KEY}
+      MINIO_SECRET_ACCESS_KEY: ${MINIO_SECRET_KEY:?set MINIO_SECRET_KEY}
     volumes:
-      - milvus_data:/var/lib/milvus
-    ports:
-      - "19530:19530"
-      - "9091:9091"
+      - ${APP_DATA_ROOT:-/data/private-domain-ai-brain}/milvus:/var/lib/milvus
     depends_on:
-      - etcd
-      - minio
-
-volumes:
-  postgres_data:
-  etcd_data:
-  minio_data:
-  milvus_data:
+      etcd:
+        condition: service_started
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
