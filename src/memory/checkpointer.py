@@ -40,7 +40,7 @@ async def init_checkpointer() -> AsyncPostgresSaver:
         _conn_pool = AsyncConnectionPool(
             conninfo=settings.database_url_sync,
             max_size=20,
-            kwargs={"autocommit": True, "row_factory": psycopg.rows.dict_row},
+            kwargs={"autocommit": True},
         )
         await _conn_pool.open()
 

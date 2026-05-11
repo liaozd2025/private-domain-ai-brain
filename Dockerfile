@@ -26,9 +26,7 @@ for dep in data["project"]["dependencies"]:
     print(dep)
 PY
 
-# 显式预装 CPU 版 torch，避免 Linux 镜像解析出大体积 CUDA 依赖
-RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch \
-    && pip install --no-cache-dir -r /tmp/requirements.txt
+RUN pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple/ -r /tmp/requirements.txt
 
 # 最后复制源码，保证日常代码改动只影响这一层
 COPY src/ ./src/

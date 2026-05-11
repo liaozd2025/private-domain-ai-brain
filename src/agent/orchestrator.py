@@ -209,6 +209,24 @@ class Orchestrator:
 
         return builder.compile(checkpointer=self.checkpointer)
 
+    @staticmethod
+    def _extract_context_query(state: OrchestratorState) -> tuple[str, str]:
+        """提取当前查询和对话上下文摘要。
+
+        Returns:
+            (query, context) — query 是最新用户消息，context 是最近几轮对话摘要（可能为空）。
+        """
+        last_message = state["messages"][-1]
+        query = last_message.content if hasattr(last_message, "content") else str(last_message)
+        recent = state["messages"][-6:-1]
+        if not recent:
+            return query, ""
+        context = "\n".join([
+            f"{'用户' if isinstance(m, HumanMessage) else 'AI'}: {str(m.content)[:200]}"
+            for m in recent
+        ])
+        return query, context
+
     async def _route_node(self, state: OrchestratorState) -> dict:
         """路由节点 - 分类用户意图"""
         last_message = state["messages"][-1]
@@ -260,15 +278,15 @@ class Orchestrator:
         """知识查询节点 - 调用 KB 子智能体"""
         from src.subagents.knowledge_base import KBAgent
 
-        last_message = state["messages"][-1]
-        query = last_message.content if hasattr(last_message, "content") else str(last_message)
+        query, context = self._extract_context_query(state)
+        contextual_query = f"[对话上下文]\n{context}\n\n[当前问题]\n{query}" if context else query
 
         user_profile = await self.profile_store.get_profile(state.get("user_id", ""))
         system_prompt = build_system_prompt(state.get("user_role", "unknown"), user_profile)
 
         kb_agent = KBAgent(llm=self.llm)
         result = await kb_agent.query(
-            query=query,
+            query=contextual_query,
             user_role=state.get("user_role", "unknown"),
             system_prompt=system_prompt,
         )
@@ -282,12 +300,12 @@ class Orchestrator:
         """数据分析节点 - 调用 Data Analysis 子智能体"""
         from src.subagents.data_analysis import DataAnalysisAgent
 
-        last_message = state["messages"][-1]
-        query = last_message.content if hasattr(last_message, "content") else str(last_message)
+        query, context = self._extract_context_query(state)
+        contextual_query = f"[对话上下文]\n{context}\n\n[当前问题]\n{query}" if context else query
 
         da_agent = DataAnalysisAgent(llm=self.llm, vision_llm=self.vision_llm)
         result = await da_agent.analyze(
-            query=query,
+            query=contextual_query,
             attachments=state.get("attachments", []),
             user_role=state.get("user_role", "unknown"),
         )
@@ -301,15 +319,15 @@ class Orchestrator:
         """附件分析节点 - 图片/文档/混合附件理解"""
         from src.subagents.attachment_analysis import AttachmentAnalysisAgent
 
-        last_message = state["messages"][-1]
-        query = last_message.content if hasattr(last_message, "content") else str(last_message)
+        query, context = self._extract_context_query(state)
+        contextual_query = f"[对话上下文]\n{context}\n\n[当前问题]\n{query}" if context else query
 
         attachment_agent = AttachmentAnalysisAgent(
             text_llm=self.llm,
             vision_llm=self.vision_llm,
         )
         result = await attachment_agent.analyze(
-            query=query,
+            query=contextual_query,
             attachments=state.get("attachments", []),
             user_role=state.get("user_role", "unknown"),
         )
@@ -323,12 +341,12 @@ class Orchestrator:
         """内容生成节点 - 调用 Content Generation 子智能体"""
         from src.subagents.content_generation import ContentGenerationAgent
 
-        last_message = state["messages"][-1]
-        query = last_message.content if hasattr(last_message, "content") else str(last_message)
+        query, context = self._extract_context_query(state)
+        contextual_query = f"[对话上下文]\n{context}\n\n[当前问题]\n{query}" if context else query
 
         cg_agent = ContentGenerationAgent(llm=self.llm)
         result = await cg_agent.generate(
-            query=query,
+            query=contextual_query,
             user_role=state.get("user_role", "unknown"),
             channel=state.get("channel", "web"),
         )
@@ -342,8 +360,7 @@ class Orchestrator:
         """工具操作节点 - 调用 OpenClaw 等工具"""
         from src.tools.openclaw_tools import OpenClawToolkit
 
-        last_message = state["messages"][-1]
-        query = last_message.content if hasattr(last_message, "content") else str(last_message)
+        query, _context = self._extract_context_query(state)
 
         # 使用 LLM + 工具 ReAct 循环执行操作
         toolkit = OpenClawToolkit()
@@ -402,6 +419,14 @@ class Orchestrator:
             configurable={"thread_id": thread_id},
         )
 
+        # 诊断：检查 checkpoint 恢复状态
+        try:
+            existing = await self.graph.aget_state(config)
+            msg_count = len(existing.values.get("messages", [])) if existing and existing.values else 0
+            logger.info("checkpoint 状态(invoke)", thread_id=thread_id, has_checkpoint=bool(existing and existing.values), message_count=msg_count)
+        except Exception as e:
+            logger.warning("checkpoint 状态查询失败", thread_id=thread_id, error=str(e))
+
         initial_state = {
             "messages": [HumanMessage(content=message)],
             "thread_id": thread_id,
@@ -432,6 +457,14 @@ class Orchestrator:
         config = RunnableConfig(
             configurable={"thread_id": thread_id},
         )
+
+        # 诊断：检查 checkpoint 恢复状态
+        try:
+            existing = await self.graph.aget_state(config)
+            msg_count = len(existing.values.get("messages", [])) if existing and existing.values else 0
+            logger.info("checkpoint 状态(stream)", thread_id=thread_id, has_checkpoint=bool(existing and existing.values), message_count=msg_count)
+        except Exception as e:
+            logger.warning("checkpoint 状态查询失败", thread_id=thread_id, error=str(e))
 
         initial_state = {
             "messages": [HumanMessage(content=message)],

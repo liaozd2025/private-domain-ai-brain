@@ -34,9 +34,9 @@ def get_embedding_client():
 
 @lru_cache(maxsize=1)
 def get_reranker_model():
-    """懒加载 BGE 重排序模型"""
+    """懒加载 BGE 重排序模型（FlagEmbedding 未安装时抛出 ImportError）"""
     import os
-    from FlagEmbedding import FlagReranker
+    from FlagEmbedding import FlagReranker  # noqa: F401
     if settings.hf_token:
         os.environ["HF_TOKEN"] = settings.hf_token
     logger.info("加载 Reranker 模型", model=settings.reranker_model)
